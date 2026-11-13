@@ -1,43 +1,114 @@
-// A PGMaps forest scene package (https://github.com/ahzs645/PGMaps, src/pages/dev-forestry/scenePackage.ts) through
-// the library on its own, as examples/gltf.ts does: the package's ground, one Nanite type per B.C. species built from
-// the model the package carries (PGMaps' own detailed tree, opaque: bark and foliage are both "bark" here, told apart
-// by colour), and the package's stems as instances, seen from its eye.
+// A PGMaps forest scene package (https://github.com/ahzs645/PGMaps, src/pages/dev-forestry/scenePackage.ts) drawn with
+// the demo's look: each B.C. species an ez-tree (branches and leaf cards, the demo's bark and leaf images) as Nanite
+// types, a few per species for the stems' crown widths (examples/pgmaps/trees.ts); the demo's sky, sun shadows, god
+// rays and TAA (src/godrays.ts, src/taa.ts); its forest floor over the package's ground, with the openings harvested,
+// the debris as slash piles and the road's cut and fill slopes bare (examples/pgmaps/floor.ts, debris.ts); optional
+// water with a planar reflection (water.ts); and the environment the parent sends: date, place, ground and weather
+// (environment.ts, particles.ts). The stems are seen from the package's eye.
 //   examples/pgmaps-scene.html?scene=<url of a package JSON>   (or pick a file). Needs WebGPU (compute).
+//   &embed: driven by a parent page (an iframe): no overlay, no pointer input, the scene and camera by postMessage.
+//   &env=<json> or &dateTime=2026-07-15T14:00:00-07:00&ground=snow&weather=overcast: an environment (as the message)
+//   &taa=0, &rays=0: switches; &tau=: the clusters' error in pixels (2)
 //
-// The package is local metres: x east, y north, z up (heights absolute). Here y is up and north is −z.
-// Instances take one uniform scale, so a stem keeps its height but its crown width is its species' median
-// (PGMaps draws each stem's own).
+// The postMessage bridge (postMessage(data, '*'); a local trial):
+//   out { type: 'pgmaps-engine-hello', engine: 'nanite' }   loaded in a frame with no ?scene: send the package
+//   in  { type: 'pgmaps-scene', scene }   a package to draw. A later one tears the drawing down (its WebGPU device
+//                                          destroyed, so nothing leaks) and builds the new one in the same page.
+//   in  { type: 'pgmaps-camera', position: [x, y, z], bearingDegrees, pitchDegrees, verticalFovDegrees }
+//                                          the eye in the frame of the latest package sent (local metres, z up). One
+//                                          that arrives while a package builds is kept, the latest, and applied after.
+//   in  { type: 'pgmaps-environment', dateTime, latitude, longitude, ground: 'bare' | 'snow', weather: 'clear' |
+//         'overcast' | 'rain' | 'snow' }   before or after a package; the latest is kept for every later build and
+//                                          applied without rebuilding (the sun from the date and place).
+//   out { type: 'pgmaps-engine-ready', engine: 'nanite' }   the first frame of a (new) package is drawn
+//   out { type: 'pgmaps-engine-stats', engine: 'nanite', drawn, fps, clusters, impostors, splats, stems }  about 1 s
+//   out { type: 'pgmaps-engine-error', engine: 'nanite', message }
+//
+// The package is local metres: x east, y north, z up (heights absolute). Here y is up and north is -z.
 import * as THREE from 'three/webgpu';
-import { Fn, texture, attribute, float, vec3, smoothstep } from 'three/tsl';
+import { attribute, float, vec3, vec4, smoothstep, mix, hash, clamp, dot } from 'three/tsl';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import {
-  NaniteRenderer, buildDag, createAtlas, bakeImpostors, impostorCoverage, makeLeafAlpha, defaultLook,
-  IMPOSTOR_CUT, PHASE2_LAYER, type NaniteType, type NaniteTextures, type Float, type Vec3,
+  NaniteRenderer, createAtlas, bakeImpostors, impostorCoverage, makeLeafAlpha, defaultLook, asReceivedShadow, mipBias,
+  IMPOSTOR_CUT, PHASE2_LAYER, type NaniteLook, type Float, type Vec3,
 } from '../src/nanite-lib/index.ts';
+import { TAA } from '../src/taa.ts';
+import { GodRays } from '../src/godrays.ts';
+import { detailPos } from '../src/planet.ts';
+import { reliefSteps } from '../src/ground/relief.ts';
+import { buildStand } from './pgmaps/trees.ts';
+import { buildTerrain, buildMasks } from './pgmaps/terrain.ts';
+import { floorMaterial } from './pgmaps/floor.ts';
+import { buildDebris } from './pgmaps/debris.ts';
+import { buildWater } from './pgmaps/water.ts';
+import { createEnvironment } from './pgmaps/environment.ts';
+import { createParticles } from './pgmaps/particles.ts';
+import { DEFAULT_ENVIRONMENT, environmentFromUrl, parseEnvironment, type Environment, type ScenePackage } from './pgmaps/package.ts';
 
-type ScenePackage = {
-  format: 'pgmaps-forest-scene';
-  version: 1;
-  terrain: { west: number; south: number; spacing: number; columns: number; rows: number; heights: Array<number | null> };
-  trees: { fields: string[]; species: string[]; count: number; data: number[] };
-  models?: Record<string, { positions: number[]; normals: number[]; bark: number[] }>;
-  camera: { position: [number, number, number]; bearingDegrees: number; pitchDegrees: number; verticalFovDegrees: number };
-};
-
-const SKY = new THREE.Color(0x9fb8cf);
-/** Each model is built this tall and scaled to its stem's height. */
-const MODEL_HEIGHT = 20;
-/** Bark and foliage colours per species, as PGMaps draws them (impostor.ts). */
-const COLOURS: Record<string, [string, string]> = {
-  pine: ['#5c4a3a', '#3e603c'],
-  spruce: ['#524034', '#2c5240'],
-  fir: ['#564e46', '#26483c'],
-  douglasFir: ['#68523f', '#30543a'],
-  aspen: ['#c6c6b8', '#708e44'],
-  birch: ['#e2ded4', '#60843e'],
-};
 const info = document.getElementById('info')!;
 const params = new URLSearchParams(location.search);
+const ENGINE = 'nanite';
+const embedded = window.parent !== window;
+if (params.has('embed')) info.hidden = true;
+const toParent = (message: Record<string, unknown>): void => {
+  if (embedded) window.parent.postMessage({ engine: ENGINE, ...message }, '*');
+};
+
+type CameraMessage = { position: [number, number, number]; bearingDegrees: number; pitchDegrees: number; verticalFovDegrees?: number };
+type Drawing = { setEye: (eye: CameraMessage) => void; setEnvironment: (env: Environment) => void; teardown: () => Promise<void> };
+/** What is drawn now, the package waiting behind a build, the parent's latest eye (in the latest package's frame) and environment. */
+let current: Drawing | null = null;
+let building = false;
+let queued: ScenePackage | null = null;
+let latestCamera: CameraMessage | null = null;
+let latestEnvironment: Environment = environmentFromUrl(params) ?? DEFAULT_ENVIRONMENT;
+
+/** Draw `scene`, after tearing down what is drawn. Packages that arrive during a build wait; only the latest is built. */
+async function show(scene: ScenePackage): Promise<void> {
+  if (building) {
+    queued = scene;
+    return;
+  }
+  building = true;
+  try {
+    if (current) await current.teardown();
+    current = null;
+    current = await build(scene, latestEnvironment);
+    current.setEnvironment(latestEnvironment); // (one that came during the build)
+    if (latestCamera) current.setEye(latestCamera);
+  } catch (error) {
+    console.error(error);
+    fail(error);
+  } finally {
+    building = false;
+    const next = queued;
+    queued = null;
+    if (next) void show(next);
+  }
+}
+
+function fail(error: unknown): void {
+  const message = error instanceof Error ? error.message : String(error);
+  info.textContent = `failed: ${message}`;
+  Object.assign(window, { pgmaps: { ready: true, error: message } });
+  toParent({ type: 'pgmaps-engine-error', message });
+}
+
+addEventListener('message', (event: MessageEvent) => {
+  const data = event.data as { type?: string; scene?: ScenePackage } & Partial<CameraMessage> & Record<string, unknown>;
+  if (data?.type === 'pgmaps-scene' && data.scene) {
+    latestCamera = null; // (an eye sent before belongs to the previous package's frame)
+    void show(data.scene);
+  } else if (data?.type === 'pgmaps-camera' && Array.isArray(data.position)) {
+    latestCamera = data as CameraMessage;
+    if (current && !building) current.setEye(latestCamera);
+  } else if (data?.type === 'pgmaps-environment') {
+    const env = parseEnvironment(data);
+    if (!env) return;
+    latestEnvironment = env;
+    if (current && !building) current.setEnvironment(env);
+  }
+});
 
 async function loadScene(): Promise<ScenePackage> {
   const url = params.get('scene');
@@ -50,226 +121,215 @@ async function loadScene(): Promise<ScenePackage> {
   });
 }
 
-/** The package's ground, gaps filled from their nearest known neighbour along the row, then the column. */
-function groundOf(scene: ScenePackage): { mesh: THREE.Mesh; heightAt: (x: number, y: number) => number } {
-  const { west, south, spacing, columns, rows } = scene.terrain;
-  const h = scene.terrain.heights.slice();
-  const fill = (index: (i: number, j: number) => number, outer: number, inner: number): void => {
-    for (let i = 0; i < outer; i++) {
-      let last: number | null = null;
-      for (let j = 0; j < inner; j++) last = h[index(i, j)] ?? last;
-      for (let j = inner - 1; j >= 0; j--) {
-        const k = index(i, j);
-        if (h[k] === null) h[k] = last;
-        else last = h[k];
-      }
-    }
+/**
+ * The stand's look in the library's hooks: per-stem brightness (a hash and the package's tone, b.w), and snow dusting
+ * the crowns when the ground is snowy. No wind: the stand stands still (the parent compares frames, and the water's
+ * reflection renders the stand without the scene target's motion output, which a wind's MRT output would need).
+ */
+function standLook(snow: THREE.UniformNode<'float', number>): NaniteLook {
+  const dusted = (c: Vec3): Vec3 => mix(c, vec3(0.78, 0.81, 0.86).mul(dot(c, vec3(0.3, 0.59, 0.11)).mul(2).add(0.55)), snow.mul(0.2));
+  const toneOf = (tone: Float): Float => clamp(tone, 0, 1).mul(0.3).add(0.85);
+  return {
+    ...defaultLook(),
+    tint: (inst) => hash(inst).mul(0.24).add(0.88),
+    cardValue: (_inst, b) => b.w,
+    impostorValue: (_inst, b) => b.w,
+    solidColour: (rgb) => rgb.mul(vec3(0.9, 0.86, 0.8)),
+    cardColour: (rgb, _layer, tint, tone) => dusted(rgb.mul(tint).mul(toneOf(tone))),
+    impostorColour: (albedo, gain, tint, tone) => dusted(albedo.mul(gain).mul(tint).mul(toneOf(tone))),
+    bakeCardColour: (rgb) => rgb,
   };
-  fill((r, c) => r * columns + c, rows, columns);
-  fill((c, r) => r * columns + c, columns, rows);
-  const at = (c: number, r: number): number => h[r * columns + c] ?? 0;
-  const heightAt = (x: number, y: number): number => {
-    const gx = Math.min(columns - 1.0001, Math.max(0, (x - west) / spacing));
-    const gy = Math.min(rows - 1.0001, Math.max(0, (y - south) / spacing));
-    const x0 = Math.floor(gx), y0 = Math.floor(gy), fx = gx - x0, fy = gy - y0;
-    return at(x0, y0) * (1 - fx) * (1 - fy) + at(x0 + 1, y0) * fx * (1 - fy) + at(x0, y0 + 1) * (1 - fx) * fy + at(x0 + 1, y0 + 1) * fx * fy;
-  };
-  const size = (columns - 1) * spacing;
-  const geometry = new THREE.PlaneGeometry(size, size, columns - 1, rows - 1).rotateX(-Math.PI / 2);
-  const p = geometry.attributes.position;
-  for (let i = 0; i < p.count; i++) p.setY(i, heightAt(p.getX(i), -p.getZ(i)));
-  geometry.computeVertexNormals();
-  return { mesh: new THREE.Mesh(geometry, new THREE.MeshStandardNodeMaterial({ color: 0x4a573a, roughness: 1 })), heightAt };
 }
 
-async function main(): Promise<void> {
-  const scene = await loadScene();
-  if (scene.format !== 'pgmaps-forest-scene' || scene.version !== 1) throw new Error('Not a PGMaps forest scene package (v1).');
-  if (!scene.models) throw new Error('This package has no species models; export it again from PGMaps.');
-
-  const renderer = new THREE.WebGPURenderer({ antialias: false });
+async function build(scene: ScenePackage, env0: Environment): Promise<Drawing> {
+  if (scene?.format !== 'pgmaps-forest-scene' || scene.version !== 1) throw new Error('Not a PGMaps forest scene package (v1).');
+  const t0 = performance.now();
+  const renderer = new THREE.WebGPURenderer({ antialias: false, powerPreference: 'high-performance' });
   await renderer.init();
   if (!(renderer.backend as unknown as { isWebGPUBackend?: boolean }).isWebGPUBackend) throw new Error('this example needs WebGPU (compute)');
   renderer.setPixelRatio(Math.min(devicePixelRatio, 1.5));
   renderer.setSize(innerWidth, innerHeight);
   renderer.shadowMap.enabled = true;
+  renderer.shadowMap.type = THREE.PCFShadowMap;
   renderer.toneMapping = THREE.ACESFilmicToneMapping;
   document.body.appendChild(renderer.domElement);
+  if (embedded || params.has('embed')) renderer.domElement.style.pointerEvents = 'none';
 
   const three = new THREE.Scene();
-  renderer.setClearColor(SKY);
   const { camera: eye } = scene;
-  const camera = new THREE.PerspectiveCamera(eye.verticalFovDegrees, innerWidth / innerHeight, 0.3, 8000);
-  camera.position.set(eye.position[0], eye.position[2], -eye.position[1]);
-  const bearing = THREE.MathUtils.degToRad(eye.bearingDegrees), pitch = THREE.MathUtils.degToRad(eye.pitchDegrees);
+  const camera = new THREE.PerspectiveCamera(eye.verticalFovDegrees, innerWidth / innerHeight, 0.3, 30000);
   const controls = new OrbitControls(camera as never, renderer.domElement);
-  controls.target.copy(camera.position).add(new THREE.Vector3(Math.sin(bearing) * Math.cos(pitch), Math.sin(pitch), -Math.cos(bearing) * Math.cos(pitch)).multiplyScalar(100));
-  controls.update();
-  const hemi = new THREE.HemisphereLight(0xdfeaf5, 0x51493f, 1.4);
-  const sun = new THREE.DirectionalLight(0xfff1dc, 2.6);
-  sun.castShadow = true;
-  sun.shadow.mapSize.set(2048, 2048);
-  Object.assign(sun.shadow.camera, { left: -150, right: 150, top: 150, bottom: -150, near: 1, far: 800 });
-  sun.shadow.camera.layers.set(1);
-  for (const l of [hemi, sun]) l.layers.enable(PHASE2_LAYER), three.add(l);
-  three.add(sun.target);
-  const ground = groundOf(scene);
-  ground.mesh.receiveShadow = true;
-  three.add(ground.mesh);
-
-  // ---------------------------------------------------------------- one type per species, from the package's model
-  const stride = scene.trees.fields.length;
-  const used = scene.trees.species.filter((_, index) => {
-    for (let i = 0; i < scene.trees.count; i++) if (scene.trees.data[i * stride + 3] === index) return true;
-    return false;
-  });
-  const none = new Float32Array(0);
-  const types: NaniteType[] = [];
-  for (const [id, name] of used.entries()) {
-    const model = scene.models[name];
-    const index = scene.trees.species.indexOf(name);
-    const ratios: number[] = [];
-    for (let i = 0; i < scene.trees.count; i++) {
-      const o = i * stride;
-      if (scene.trees.data[o + 3] === index) ratios.push(scene.trees.data[o + 5] / scene.trees.data[o + 4]);
-    }
-    ratios.sort((a, b) => a - b);
-    const across = MODEL_HEIGHT * ratios[Math.floor(ratios.length / 2)];
-    const n = model.positions.length / 3;
-    const pos = new Float32Array(n * 3), nrm = new Float32Array(n * 3), uv = new Float32Array(n * 2);
-    let radius = 0;
-    for (let v = 0; v < n; v++) {
-      const x = model.positions[v * 3] * across, y = model.positions[v * 3 + 2] * MODEL_HEIGHT, z = -model.positions[v * 3 + 1] * across;
-      pos.set([x, y, z], v * 3);
-      nrm.set([model.normals[v * 3], model.normals[v * 3 + 2], -model.normals[v * 3 + 1]], v * 3);
-      // Wood samples the left half of the species' texture layer, foliage the right.
-      uv.set([model.bark[v] ? 0.25 : 0.75, 0.5], v * 2);
-      radius = Math.max(radius, Math.hypot(x, y - MODEL_HEIGHT / 2, z));
-    }
-    const idx = Uint32Array.from({ length: n }, (_, i) => i);
-    const bark = { pos, nrm, uv, idx };
-    const leaves = { pos: none, nrm: none, uv: none, vpl: 4 };
-    const dag = await buildDag({ id, bark, leaves });
-    types.push({ ...dag, name, radius, height: MODEL_HEIGHT, impostorSolid: true, src: { bark, leaves } });
-  }
-
-  // ---------------------------------------------------------------- the stems: a = (x, y, z, scale), b = (cos, sin, type, user)
-  const order = Array.from({ length: scene.trees.count }, (_, i) => i).sort(
-    (a, b) => scene.trees.data[a * stride + 3] - scene.trees.data[b * stride + 3],
-  );
-  const a = new Float32Array(scene.trees.count * 4), b = new Float32Array(scene.trees.count * 4);
-  order.forEach((i, k) => {
-    const o = i * stride;
-    const type = used.indexOf(scene.trees.species[scene.trees.data[o + 3]]);
-    const yaw = scene.trees.data[o + 6] * Math.PI * 2;
-    a.set([scene.trees.data[o], scene.trees.data[o + 2], -scene.trees.data[o + 1], scene.trees.data[o + 4] / MODEL_HEIGHT], k * 4);
-    b.set([Math.cos(yaw), Math.sin(yaw), type, 0], k * 4);
-  });
-
-  // One 4 × 4 texture layer per species: bark colour on the left, foliage on the right.
-  const pixels = new Uint8Array(4 * 4 * 4 * used.length);
-  used.forEach((name, layer) => {
-    const [wood, leaf] = (COLOURS[name] ?? ['#5c4a3a', '#3e603c']).map((c) => new THREE.Color(c));
-    for (let y = 0; y < 4; y++)
-      for (let x = 0; x < 4; x++) {
-        const c = x < 2 ? wood : leaf, o = ((layer * 4 + y) * 4 + x) * 4;
-        pixels.set([c.r * 255, c.g * 255, c.b * 255, 255], o);
-      }
-  });
-  const barkTexture = new THREE.DataArrayTexture(pixels, 4, 4, used.length);
-  barkTexture.colorSpace = THREE.SRGBColorSpace;
-  barkTexture.needsUpdate = true;
-  barkTexture.userData.levels = 1;
-  barkTexture.userData.alphaScales = [1];
-  const leafTexture = new THREE.DataArrayTexture(new Uint8Array(4 * 4 * 4).fill(255), 4, 4, 1);
-  leafTexture.needsUpdate = true;
-  leafTexture.userData.levels = 1;
-  leafTexture.userData.alphaScales = [1];
-  const textures: NaniteTextures = {
-    bark: barkTexture,
-    leaf: leafTexture,
-    barkLayerOf: (type) => float(type),
-    leafLayerOf: () => float(0),
-    alphaToCoverage: false,
-    leafDither: false,
-    softLeafDither: false,
-    impostorDither: false,
+  controls.enabled = !params.has('embed'); // (embedded, the parent drives the camera)
+  /** The package's eye (local metres, z up, bearing clockwise from north) as the camera and the orbit's target. */
+  const setEye = (e: CameraMessage): void => {
+    const b = THREE.MathUtils.degToRad(e.bearingDegrees), p = THREE.MathUtils.degToRad(e.pitchDegrees);
+    camera.position.set(e.position[0], e.position[2], -e.position[1]);
+    if (e.verticalFovDegrees) camera.fov = e.verticalFovDegrees;
+    camera.updateProjectionMatrix();
+    controls.target.copy(camera.position).add(new THREE.Vector3(Math.sin(b) * Math.cos(p), Math.sin(p), -Math.cos(b) * Math.cos(p)).multiplyScalar(100));
+    controls.update();
   };
-  const look = defaultLook();
-  const nanite = new NaniteRenderer(renderer, types, { a, b }, textures, look);
-  nanite.u.maxDist.value = 6000;
-  const fog = (_pos: Vec3, viewZ: Float) => ({ color: vec3(SKY.r, SKY.g, SKY.b), factor: smoothstep(2500, 6000, viewZ) });
-  const shading = { fadeShadow: () => Fn(([shadow]: [Float]) => shadow), fog };
-  nanite.group.add(nanite.sw.buildResolveMesh(shading));
+  setEye(eye);
+
+  // ---------------------------------------------------------------- ground, sky, light
+  const terrain = buildTerrain(scene);
+  const envr = createEnvironment(three, terrain.heightAt);
+  const masks = buildMasks(scene, terrain.bounds);
+  const samples = 1; // (TAA: leaves by coverage against a moving dither; see src/webgpu-start.ts)
+  const [floor, stand] = await Promise.all([floorMaterial({ masks, snow: envr.snow, wet: envr.wet, fadeShadow: (far) => envr.fadeShadow(far) }), buildStand(scene, samples)]);
+  terrain.mesh.material = floor;
+  terrain.mesh.renderOrder = 1; // (after the trees: what they hide is rejected before the floor's shader)
+  three.add(terrain.mesh);
+  const debris = await buildDebris(scene, terrain.heightAt, envr.snow);
+  if (debris) three.add(debris);
+  const water = buildWater(scene, terrain.waterLevels, { sunDir: envr.lightDir, sunColour: envr.sun.color });
+  if (water) three.add(water.group);
+  const particles = createParticles();
+  three.add(particles.mesh);
+
+  // ---------------------------------------------------------------- the stand
+  const look = standLook(envr.snow);
+  const { types, instances, textures } = stand;
+  const nanite = new NaniteRenderer(renderer, types, instances, textures, look);
+  nanite.u.maxDist.value = 9000;
+  nanite.u.tau.value = Number(params.get('tau') ?? 2); // (px of error: at 1 the stand's lists overflowed into 17-35 ms frames on an M4 Pro, at 2 ~5.5 ms)
+  const treeShade = float(0.4); // (past the shadow map, the crowns' average self-shade)
+  nanite.group.traverse((o) => {
+    if (o instanceof THREE.Mesh && !o.castShadow) (o.material as THREE.NodeMaterial).receivedShadowNode = asReceivedShadow(envr.fadeShadow(treeShade));
+  });
+  const fog = (pos: Vec3, viewZ: Float) => ({ color: envr.fogColour(pos), factor: smoothstep(envr.fogNear, envr.fogFar, viewZ) });
+  nanite.group.add(nanite.sw.buildResolveMesh({ fadeShadow: (pos: Vec3) => envr.fadeShadow(treeShade, pos), fog }));
   const atlas = createAtlas(types.length);
   const impostors = nanite.buildImpostorMesh(atlas, types.map(() => ({ side: [1, 1, 1] as [number, number, number], top: [1, 1, 1] as [number, number, number] })));
   impostors.receiveShadow = true;
-  nanite.group.add(impostors, nanite.splats.build(atlas, { ...shading, shadow: () => Fn(([shadow]: [Float]) => shadow) }), nanite.buildImpostorShadowMesh(atlas));
-  bakeImpostors(renderer, atlas, types, { bark: textures.bark, leaf: textures.leaf, barkLayers: types.map((_, i) => i), leafLayers: types.map(() => 0), leafAlpha: makeLeafAlpha(textures.leaf, attribute('uv', 'vec2')) }, look, nanite.u.impostorPx.value);
+  (impostors.material as THREE.NodeMaterial).receivedShadowNode = asReceivedShadow(envr.fadeShadow(treeShade));
+  nanite.group.add(impostors, nanite.splats.build(atlas, { fadeShadow: (pos: Vec3) => envr.fadeShadow(treeShade, pos), shadow: (pos: Vec3) => envr.fadeShadow(treeShade, pos), fog }), nanite.buildImpostorShadowMesh(atlas));
+  bakeImpostors(renderer, atlas, types, { bark: textures.bark, leaf: textures.leaf, barkLayers: stand.barkLayers, leafLayers: stand.leafLayers, leafAlpha: makeLeafAlpha(textures.leaf, attribute('uv', 'vec2')) }, look, nanite.u.impostorPx.value);
   await impostorCoverage(renderer, atlas, IMPOSTOR_CUT);
   nanite.impostorsBaked(atlas, types.map(() => [1, 1] as [number, number]));
   nanite.splats.enabled.value = 1;
   three.add(nanite.group);
-  three.fog = new THREE.Fog(SKY, 2500, 6000);
 
-  // ---------------------------------------------------------------- the frame, as examples/gltf.ts draws it
-  const target = new THREE.RenderTarget(1, 1, { type: THREE.HalfFloatType, depthBuffer: true });
-  target.depthTexture = new THREE.DepthTexture(1, 1, THREE.FloatType);
-  nanite.setDepthSource(target.depthTexture, 1);
-  const present = new THREE.QuadMesh(new THREE.MeshBasicNodeMaterial({ colorNode: texture(target.texture) }));
+  // ---------------------------------------------------------------- the frame: the demo's targets and passes
+  const sceneRT = new THREE.RenderTarget(1, 1, { type: THREE.HalfFloatType, samples, depthBuffer: true });
+  sceneRT.depthTexture = new THREE.DepthTexture(1, 1, THREE.FloatType);
+  nanite.setDepthSource(sceneRT.depthTexture, samples);
+  const rays = new GodRays(renderer, sceneRT.depthTexture, envr.sunDir, { enabled: params.get('rays') !== '0' });
+  const taa = new TAA(renderer, sceneRT, samples, { enabled: params.get('taa') !== '0', extra: rays.at });
+  const output = new THREE.RenderPipeline(renderer, vec4(taa.displayNode, 1));
   const size = new THREE.Vector2();
   const resize = (): void => {
     camera.aspect = innerWidth / innerHeight;
     camera.updateProjectionMatrix();
     renderer.setSize(innerWidth, innerHeight);
     renderer.getDrawingBufferSize(size);
-    target.setSize(size.x, size.y);
+    sceneRT.setSize(size.x, size.y);
   };
   addEventListener('resize', resize);
   resize();
 
-  const t0 = performance.now();
-  let lastStats = 0;
-  const state = { frames: 0, nanite, camera, controls, ready: false };
+  const setEnvironment = (env: Environment): void => {
+    const sun = envr.apply(env, scene.origin);
+    particles.set(env.weather === 'rain' || env.weather === 'snow' ? env.weather : null);
+    water?.update();
+    state.environment = { ...env, sunElevation: +sun.elevation.toFixed(2), sunAzimuth: +sun.azimuth.toFixed(2) };
+  };
+
+  const still = new THREE.Vector3(); // (the TAA's planet drop: none here)
+  let lastStats = 0, lastPost = 0, disposed = false;
+  /** The stats readback in flight: teardown waits for it, since destroying the device aborts its mapAsync. */
+  let reading: Promise<unknown> | null = null;
+  let fps = 0, lastFrame = performance.now();
+  const state: Record<string, unknown> & { frames: number; ready: boolean } = {
+    frames: 0, nanite, camera, controls, scene: three, ready: false, residual: stand.residual, buildMs: 0, environment: null,
+    debug: { envr, rays, taa, terrain, reliefSteps, noShadows: false, noRays: false },
+  };
   Object.assign(window, { pgmaps: state });
-  renderer.setAnimationLoop(async () => {
+  setEnvironment(env0);
+  const t1 = performance.now();
+  const frame = (): void => {
     state.frames++;
-    const time = (performance.now() - t0) / 1000;
+    const now = performance.now();
+    fps = fps ? fps * 0.9 + (1000 / Math.max(1, now - lastFrame)) * 0.1 : 60;
+    lastFrame = now;
+    const time = (now - t1) / 1000;
     controls.update();
     camera.updateMatrixWorld();
     look.viewer.copy(camera.position);
-    sun.position.set(camera.position.x - 160, camera.position.y + 220, camera.position.z - 60);
-    sun.target.position.set(camera.position.x, camera.position.y, camera.position.z);
-    sun.updateMatrixWorld();
-    sun.target.updateMatrixWorld();
-    sun.shadow.camera.updateMatrixWorld();
-    nanite.update(camera, size, time, sun.shadow.camera);
-    renderer.setRenderTarget(target);
+    detailPos.value.copy(camera.position); // (the floor's relief fades from the eye)
+    particles.update(time, camera.position);
+    const debug = state.debug as { noShadows: boolean; noRays: boolean };
+    const castShadows = envr.frame(renderer, camera, !debug.noShadows);
+    rays.enabled = params.get('rays') !== '0' && envr.raysOn() && !debug.noRays;
+    taa.jitter(camera, size.x, size.y);
+    mipBias.value = 0;
+    // the software rasterizer and its splats only from high up, as the demo's (src/webgpu-frame.ts: from 2 km, down to
+    // 70% of it): near the ground its tiny leaf clusters, dithered, came out as pale specks on the crowns' tips
+    const altitude = camera.position.y - terrain.heightAt(camera.position.x, camera.position.z);
+    nanite.sw.idle = nanite.splats.idle = altitude < (nanite.sw.idle ? 2000 : 1400);
+    nanite.update(camera, size, time, castShadows ? envr.sun.shadow.camera : null);
+    // phase 1: ground, sky and the trees visible last frame (and the shadow map)
+    renderer.setRenderTarget(sceneRT);
     camera.layers.set(0);
     renderer.render(three, camera);
+    // phase 2: occlusion from that depth, the rest of the stand, the tiny clusters and the precipitation
     nanite.occlusion(camera, size.x, size.y);
     nanite.rasterize(camera, size.x, size.y);
     const autoClear = renderer.autoClear;
     renderer.autoClear = false;
-    sun.shadow.autoUpdate = false;
+    envr.sun.shadow.needsUpdate = false; // (drawn in phase 1)
     camera.layers.set(PHASE2_LAYER);
     renderer.render(three, camera);
     camera.layers.set(0);
-    sun.shadow.autoUpdate = true;
     renderer.autoClear = autoClear;
+    rays.render(camera, size.x, size.y);
+    taa.resolve(camera, still);
     renderer.setRenderTarget(null);
-    present.render(renderer);
-    if (time - lastStats > 0.5) {
-      lastStats = time;
-      const s = await nanite.readStats();
-      info.textContent = `${scene.trees.count.toLocaleString()} stems from the package, ${types.length} species\n` +
-        `drawn: ${s.instances.toLocaleString()} as clusters, ${s.impostors.toLocaleString()} impostors, ${(s.splats ?? 0).toLocaleString()} splats`;
-      state.ready = state.frames > 10;
+    output.render();
+    if (state.frames === 1) {
+      state.buildMs = Math.round(performance.now() - t0);
+      toParent({ type: 'pgmaps-engine-ready' });
     }
-  });
+    if (time - lastStats > 0.5 && !reading) {
+      lastStats = time;
+      reading = nanite.readStats().then((s) => {
+        reading = null;
+        if (!s || disposed) return;
+        info.textContent = `${scene.trees.count.toLocaleString()} stems, ${types.length} tree types (${stand.residual.lines.length - types.length} species)\n` +
+          `drawn: ${s.instances.toLocaleString()} as clusters, ${s.impostors.toLocaleString()} impostors, ${(s.splats ?? 0).toLocaleString()} splats\n` +
+          `crown width off by ${(stand.residual.mean * 100).toFixed(1)}% mean, ${(stand.residual.p90 * 100).toFixed(1)}% p90`;
+        state.ready = state.frames > 10;
+        if (time - lastPost >= 1) {
+          lastPost = time;
+          toParent({
+            type: 'pgmaps-engine-stats', drawn: s.instances + s.impostors, fps: Math.round(fps),
+            clusters: s.instances, impostors: s.impostors, splats: s.splats ?? 0, stems: scene.trees.count,
+          });
+        }
+      }, () => (reading = null));
+    }
+  };
+  renderer.setAnimationLoop(frame);
+
+  return {
+    setEye,
+    setEnvironment,
+    teardown: async () => {
+      disposed = true;
+      renderer.setAnimationLoop(null);
+      await reading?.catch(() => undefined);
+      removeEventListener('resize', resize);
+      controls.dispose();
+      // (destroys the WebGPU device this renderer made: every buffer, texture and pipeline of this package with it)
+      await renderer.dispose();
+      renderer.domElement.remove();
+    },
+  };
 }
 
-main().catch((error: unknown) => {
-  info.textContent = `failed: ${error instanceof Error ? error.message : String(error)}`;
-  Object.assign(window, { pgmaps: { ready: true, error: String(error) } });
-});
+if (params.has('scene') || !embedded) loadScene().then(show, fail);
+else {
+  info.textContent = 'waiting for a scene from the parent page';
+  toParent({ type: 'pgmaps-engine-hello' });
+}
+
