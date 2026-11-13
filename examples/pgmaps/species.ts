@@ -1,7 +1,7 @@
 // The B.C. species PGMaps sends, as ez-tree trees: a preset and the changes that make a conifer a narrow spire and a
-// broadleaf an open crown, the demo's bark and leaf images tinted per species, and the crown-width classes a
-// species' stems are binned into (instances take one uniform scale: a type per class keeps each stem's height and
-// gets its crown width approximately). No DOM: the tree worker reads it too.
+// broadleaf an open crown, and the demo's bark and leaf images tinted per species (a species' stems go on crown-width
+// rungs in tree-bins.ts: instances take one uniform scale, so a type per rung keeps each stem's height and gets its
+// crown width approximately). No DOM: the tree worker reads it too.
 
 export type BarkImage = 'pine' | 'birch' | 'oak';
 export type LeafImage = 'pine' | 'aspen' | 'ash' | 'oak';
@@ -42,35 +42,6 @@ export const SPECIES: Record<string, SpeciesLook> = {
 /** A species the adapter has no look for draws as this one. */
 export const FALLBACK_SPECIES = 'spruce';
 export const lookOf = (species: string): SpeciesLook => SPECIES[species] ?? SPECIES[FALLBACK_SPECIES];
-
-/** Width classes per species (types: species x classes; fewer when a species has few stems). */
-export const WIDTH_CLASSES = 3;
-
-/**
- * A species' stems' crown width / height ratios binned into up to `k` classes (1-D k-means on the log ratio): each
- * class's ratio (the geometric mean of its stems'), and each stem's class.
- */
-export function widthClasses(ratios: number[], k = WIDTH_CLASSES): { centres: number[]; classOf: number[] } {
-  const logs = ratios.map((r) => Math.log(Math.max(0.02, r)));
-  const sorted = logs.slice().sort((a, b) => a - b);
-  const n = Math.min(k, new Set(sorted.map((v) => v.toFixed(3))).size);
-  let centres = Array.from({ length: n }, (_, i) => sorted[Math.floor(((i + 0.5) / n) * (sorted.length - 1))]);
-  const classOf = new Array<number>(logs.length).fill(0);
-  for (let iter = 0; iter < 30; iter++) {
-    const sum = new Array<number>(n).fill(0), count = new Array<number>(n).fill(0);
-    logs.forEach((v, i) => {
-      let best = 0;
-      for (let c = 1; c < n; c++) if (Math.abs(v - centres[c]) < Math.abs(v - centres[best])) best = c;
-      classOf[i] = best;
-      sum[best] += v;
-      count[best]++;
-    });
-    const next = centres.map((c, i) => (count[i] ? sum[i] / count[i] : c));
-    if (next.every((c, i) => Math.abs(c - centres[i]) < 1e-6)) break;
-    centres = next;
-  }
-  return { centres: centres.map(Math.exp), classOf };
-}
 
 /** Deep-merges `over` into `into` (plain objects; ez-tree's options). */
 export function mergeOptions(into: Record<string, unknown>, over: Record<string, unknown>): void {

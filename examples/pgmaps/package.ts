@@ -39,10 +39,20 @@ export type Ground = 'bare' | 'snow';
 export type Weather = 'clear' | 'overcast' | 'rain' | 'snow';
 
 /** The parent's `pgmaps-environment` message (without its type). */
+export type SunMode = 'true' | 'daylight';
+
 export interface Environment {
   dateTime?: string;
+  /** IANA zone the parent's `dateTime` is in (used for a `dateTime` with no offset). */
+  timeZone?: string;
+  /** The instant as an ISO UTC string: preferred over `dateTime` when both are given. */
+  utc?: string;
+  /** 'true': the light from the real sun, none below the horizon; 'daylight' (or absent): held a few degrees up. */
+  sun?: SunMode;
   latitude?: number;
   longitude?: number;
+  /** The parent's own sun for that instant and place (degrees); used as given, so every engine lights it alike. */
+  sunPosition?: { elevationDegrees: number; azimuthDegrees: number };
   ground: Ground;
   weather: Weather;
 }
@@ -58,9 +68,46 @@ export function parseEnvironment(data: Record<string, unknown> | null | undefine
   if (!data) return null;
   const num = (v: unknown): number | undefined => (v === undefined || v === null || v === '' || !Number.isFinite(Number(v)) ? undefined : Number(v));
   const dateTime = typeof data.dateTime === 'string' && !Number.isNaN(Date.parse(data.dateTime)) ? data.dateTime : undefined;
+  const utc = typeof data.utc === 'string' && !Number.isNaN(Date.parse(data.utc)) ? data.utc : undefined;
+  const timeZone = typeof data.timeZone === 'string' && validZone(data.timeZone) ? data.timeZone : undefined;
+  const sun: SunMode = data.sun === 'true' ? 'true' : 'daylight';
   const ground = GROUNDS.includes(data.ground as Ground) ? (data.ground as Ground) : 'bare';
   const weather = WEATHERS.includes(data.weather as Weather) ? (data.weather as Weather) : 'clear';
-  return { dateTime, latitude: num(data.latitude), longitude: num(data.longitude), ground, weather };
+  const given = data.sunPosition as Record<string, unknown> | undefined;
+  const elevationDegrees = num(given?.elevationDegrees), azimuthDegrees = num(given?.azimuthDegrees);
+  const sunPosition = elevationDegrees !== undefined && azimuthDegrees !== undefined ? { elevationDegrees, azimuthDegrees } : undefined;
+  return { dateTime, timeZone, utc, sun, latitude: num(data.latitude), longitude: num(data.longitude), sunPosition, ground, weather };
+}
+
+function validZone(zone: string): boolean {
+  try {
+    new Intl.DateTimeFormat('en-US', { timeZone: zone });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** A wall-clock time with no offset ("2026-07-15T14:00") read in `zone`: the instant it names there. */
+function inZone(wall: string, zone: string): Date {
+  const asUtc = Date.parse(`${wall}Z`);
+  const offset = (t: number): number => {
+    const p = Object.fromEntries(new Intl.DateTimeFormat('en-US', { timeZone: zone, hourCycle: 'h23', year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit' })
+      .formatToParts(new Date(t)).map((x) => [x.type, x.value]));
+    return Date.UTC(+p.year, +p.month - 1, +p.day, +p.hour, +p.minute, +p.second) - Math.floor(t / 1000) * 1000;
+  };
+  let t = asUtc - offset(asUtc);
+  t = asUtc - offset(t); // (once more: across a change of offset)
+  return new Date(t);
+}
+
+/** The environment's instant: `utc` when given, else `dateTime` (with no offset of its own, read in `timeZone`). */
+export function instantOf(env: Environment): Date | null {
+  if (env.utc) return new Date(env.utc);
+  if (!env.dateTime) return null;
+  const hasOffset = /(?:Z|[+-]\d{2}(?::?\d{2})?)$/i.test(env.dateTime) || !/T\d/.test(env.dateTime);
+  if (!hasOffset && env.timeZone && !Number.isNaN(Date.parse(`${env.dateTime}Z`))) return inZone(env.dateTime, env.timeZone);
+  return new Date(env.dateTime);
 }
 
 /** `?env=<json>` or `?dateTime=…&latitude=…&longitude=…&ground=snow&weather=overcast` (standalone testing). */
@@ -73,7 +120,7 @@ export function environmentFromUrl(params: URLSearchParams): Environment | null 
       return null;
     }
   }
-  const keys = ['dateTime', 'latitude', 'longitude', 'ground', 'weather'];
+  const keys = ['dateTime', 'utc', 'timeZone', 'sun', 'latitude', 'longitude', 'ground', 'weather'];
   if (!keys.some((k) => params.has(k))) return null;
   return parseEnvironment(Object.fromEntries(keys.map((k) => [k, params.get(k) ?? undefined])));
 }
@@ -111,10 +158,12 @@ export function solarPosition(date: Date, latitude: number, longitude: number): 
 /** The default sun (no date given): 50 degrees up in the south-south-west, a summer early afternoon in B.C. */
 export const DEFAULT_SUN = { elevation: 50, azimuth: 200 };
 
-/** The sun for an environment at the package's origin (the message's latitude / longitude first). */
+/** The sun for an environment: the parent's `sunPosition` when given, else worked out at the message's place (or the package's origin). */
 export function sunFor(env: Environment, origin?: ScenePackage['origin']): { elevation: number; azimuth: number } {
-  if (!env.dateTime) return DEFAULT_SUN;
+  if (env.sunPosition) return { elevation: env.sunPosition.elevationDegrees, azimuth: env.sunPosition.azimuthDegrees };
+  const at = instantOf(env);
+  if (!at) return DEFAULT_SUN;
   const lat = env.latitude ?? origin?.lat, lon = env.longitude ?? origin?.lng;
   if (lat === undefined || lon === undefined) return DEFAULT_SUN;
-  return solarPosition(new Date(env.dateTime), lat, lon);
+  return solarPosition(at, lat, lon);
 }

@@ -1,12 +1,14 @@
-// A package's stems as Nanite types and instances: per species, its stems' crown width / height ratios binned into
-// width classes (species.ts), one ez-tree type grown per (species, class) in a worker (tree-worker.ts), each stem an
-// instance of its class's type at its own height. The demo's bark and leaf images (public/textures), tinted per
+// A package's stems as Nanite types and instances: per species, each stem's crown width / height ratio put on the
+// rung of a fixed ladder nearest it (tree-bins.ts: never from the other stems, so a harvest leaves the retained stems'
+// trees as they were), one ez-tree type grown per (species, rung) in a worker (tree-worker.ts), each stem an
+// instance of its rung's type at its own height. The demo's bark and leaf images (public/textures), tinted per
 // species, are the texture arrays. Grown types and loaded images are kept for the page's later packages.
 import * as THREE from 'three/webgpu';
 import { loadLayer, arrayTexture, layerLookup } from '../../src/textures.ts';
 import type { LayerData } from '../../src/texture-pixels.ts';
 import { LEAF_DITHER, type NaniteType, type NaniteTextures } from '../../src/nanite-lib/index.ts';
-import { lookOf, widthClasses, type BarkImage, type LeafImage } from './species.ts';
+import { lookOf, type BarkImage, type LeafImage } from './species.ts';
+import { assignBins, binRatio, binSeed, errorSummary } from './tree-bins.ts';
 import type { GrowJob, GrowReply } from './tree-worker.ts';
 import type { ScenePackage } from './package.ts';
 
@@ -31,17 +33,34 @@ function tinted(l: LayerData, [r, g, b]: [number, number, number]): LayerData {
   return { px, alphaScales: l.alphaScales, mask: l.mask };
 }
 
+/** Workers growing at once: each instantiates its own WebAssembly memory, and a package's 30-odd types started
+ * together ran the page out of it ("Cannot allocate Wasm memory"). */
+const MAX_GROWING = Math.max(2, Math.min(6, (navigator.hardwareConcurrency || 4) - 1));
+let growing = 0;
+const waiting: (() => void)[] = [];
+async function slot<T>(run: () => Promise<T>): Promise<T> {
+  if (growing >= MAX_GROWING) await new Promise<void>((go) => waiting.push(go)); // (handed the slot as it frees)
+  else growing++;
+  try {
+    return await run();
+  } finally {
+    const next = waiting.shift();
+    if (next) next();
+    else growing--;
+  }
+}
+
 const grown = new Map<string, Promise<GrowReply>>();
 function growType(job: Omit<GrowJob, 'id'>, id: number): Promise<GrowReply> {
   const key = JSON.stringify({ ...job, leafMask: null });
   let p = grown.get(key);
   if (!p) {
-    p = new Promise<GrowReply>((resolve, reject) => {
+    p = slot(() => new Promise<GrowReply>((resolve, reject) => {
       const w = new Worker(new URL('./tree-worker.ts', import.meta.url), { type: 'module' });
       w.onmessage = (e: MessageEvent<GrowReply>) => (w.terminate(), resolve(e.data));
       w.onerror = (e) => (w.terminate(), reject(new Error(`tree worker: ${e.message}`)));
       w.postMessage({ ...job, id } satisfies GrowJob);
-    });
+    }));
     grown.set(key, p);
     p.then((r) => 'error' in r && grown.delete(key), () => grown.delete(key));
   }
@@ -54,7 +73,8 @@ export interface Stand {
   textures: NaniteTextures;
   barkLayers: number[];
   leafLayers: number[];
-  /** Mean and 90th percentile of |stem crown width / drawn crown width - 1|, and the classes' log. */
+  /** Mean and 90th percentile of |stem crown width / drawn crown width - 1| (the drawn width: the grown model's
+   * measured ratio after its scaling across, at the stem's height), and the types' log. */
   residual: { mean: number; p90: number; lines: string[] };
   growMs: number;
 }
@@ -74,9 +94,10 @@ export async function buildStand(scene: ScenePackage, samples: number): Promise<
   }
   const used = [...stemsOf.keys()].sort((x, y) => x - y);
   const names = used.map((i) => scene.trees.species[i] ?? 'spruce');
-  const jobs: { job: Omit<GrowJob, 'id'>; species: number; layer: number }[] = [];
+  const jobs: { job: Omit<GrowJob, 'id'>; species: number; layer: number; bin: number }[] = [];
   const typeOf = new Int32Array(count);
-  const errors: number[] = [];
+  /** Each stem's own ratio, for its error against what its type draws. */
+  const ratioAt = new Float64Array(count);
   const lines: string[] = [];
   for (const [layer, sp] of used.entries()) {
     const name = names[layer], look = lookOf(name), info = scene.species?.[name];
@@ -86,18 +107,21 @@ export async function buildStand(scene: ScenePackage, samples: number): Promise<
       return Number.isFinite(w) && w > 0 ? w / Math.max(1, data[o + F.height]) : (info?.crownRatio ?? 0.25);
     };
     const ratios = stems.map(ratioOf);
-    const { centres, classOf } = widthClasses(ratios);
+    const { binOf, bins } = assignBins(ratios);
     const mask = (await leafImage(look.leaf)).mask;
-    const first = jobs.length;
-    centres.forEach((ratio, c) => jobs.push({
-      job: { look, seed: look.seed + c * 17, height: MODEL_HEIGHT, ratio: Math.min(1.2, Math.max(0.08, ratio)), crownBase: info?.crownBase ?? null, leafMask: mask },
-      species: sp, layer,
-    }));
+    const jobOfBin = new Map<number, number>();
+    for (const bin of bins) {
+      jobOfBin.set(bin, jobs.length);
+      jobs.push({
+        job: { look, seed: binSeed(look.seed, bin), height: MODEL_HEIGHT, ratio: binRatio(bin), crownBase: info?.crownBase ?? null, leafMask: mask },
+        species: sp, layer, bin,
+      });
+    }
     stems.forEach((i, k) => {
-      typeOf[i] = first + classOf[k];
-      errors.push(Math.abs(ratios[k] / centres[classOf[k]] - 1));
+      typeOf[i] = jobOfBin.get(binOf[k])!;
+      ratioAt[i] = ratios[k];
     });
-    lines.push(`${name}: ${stems.length} stems, crown/height classes ${centres.map((c) => c.toFixed(2)).join(' / ')}`);
+    lines.push(`${name}: ${stems.length} stems, crown/height rungs ${bins.map((b) => `${b}:${binRatio(b).toFixed(2)}`).join(' / ')}`);
   }
   const replies = await Promise.all(jobs.map(({ job }, id) => growType(job, id)));
   const types: NaniteType[] = replies.map((r, id) => {
@@ -106,8 +130,12 @@ export async function buildStand(scene: ScenePackage, samples: number): Promise<
     return { ...r, id, name: `${names[jobs[id].layer]}-${id}`, radius, height, src };
   });
   replies.forEach((r, id) => {
-    if (!('error' in r)) lines.push(`  type ${id}: ratio ${jobs[id].job.ratio.toFixed(2)} grown ${r.grown.toFixed(2)} (x${r.squash.toFixed(2)} across), ${(r.idx.length / 3).toLocaleString()} tris, ${Math.round(r.ms)} ms`);
+    if (!('error' in r)) lines.push(`  type ${id}: rung ${jobs[id].bin} ratio ${jobs[id].job.ratio.toFixed(2)} grown ${r.grown.toFixed(2)} (x${r.squash.toFixed(2)} across), ${(r.idx.length / 3).toLocaleString()} tris, ${Math.round(r.ms)} ms`);
   });
+  // each stem's crown width against what is drawn: the grown model's ratio after its scaling across (the worker
+  // measures `grown` before it and takes the rest up with `squash`)
+  const drawnRatio = replies.map((r, id) => ('error' in r ? jobs[id].job.ratio : r.grown * r.squash));
+  const errors = Array.from({ length: count }, (_, i) => Math.abs(ratioAt[i] / drawnRatio[typeOf[i]] - 1));
 
   // the instances, in type order: a = (x, y, z, scale), b = (cos, sin, type, tone)
   const order = Array.from({ length: count }, (_, i) => i).sort((x, y) => typeOf[x] - typeOf[y]);
@@ -136,7 +164,6 @@ export async function buildStand(scene: ScenePackage, samples: number): Promise<
     alphaToCoverage: samples > 1,
     leafDither: samples === 1 && LEAF_DITHER,
   };
-  errors.sort((x, y) => x - y);
-  const mean = errors.reduce((s, e) => s + e, 0) / Math.max(1, errors.length);
-  return { types, instances: { a, b }, textures, barkLayers: layers, leafLayers: layers, residual: { mean, p90: errors[Math.floor(errors.length * 0.9)] ?? 0, lines }, growMs: performance.now() - t0 };
+  const { mean, p90 } = errorSummary(errors);
+  return { types, instances: { a, b }, textures, barkLayers: layers, leafLayers: layers, residual: { mean, p90, lines }, growMs: performance.now() - t0 };
 }

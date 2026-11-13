@@ -1,29 +1,20 @@
 // The package's debris (slash left in a cut block): each point a low, ragged mat of fine slash (branches and dead
 // needles) its footprint across, a few bucked logs lying over and round it and a scatter of branches. Three instanced
 // meshes, shadow casters (layer 1, the sun's) and receivers; the logs and branches in the demo's pine bark image; snow
-// settles on their tops.
+// settles on their tops. Each pile's shape comes from its own place (geometrySeed: its rounded coordinates), never
+// from its order in the package, so a phase that adds or drops piles leaves the others as they were.
 import * as THREE from 'three/webgpu';
 import { Fn, attribute, positionWorld, mx_noise_float, vec2, vec3, mix, smoothstep, texture, uv, float } from 'three/tsl';
 import { snowOn } from './floor.ts';
 import { barkImage } from './trees.ts';
 import type { ScenePackage } from './package.ts';
-
-/** A seeded random in 0..1. */
-function random(seed: number): () => number {
-  let a = seed >>> 0;
-  return () => {
-    a = (a + 0x6d2b79f5) | 0;
-    let t = Math.imul(a ^ (a >>> 15), 1 | a);
-    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
-    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
-  };
-}
+import { geometrySeed, random } from './tree-bins.ts';
 
 export async function buildDebris(scene: ScenePackage, heightAt: (x: number, z: number) => number, snow: THREE.UniformNode<'float', number>): Promise<THREE.Group | null> {
   const d = scene.debris;
   if (!d?.count) return null;
   const st = d.fields.length, fx = d.fields.indexOf('x'), fy = d.fields.indexOf('y'), fz = d.fields.indexOf('z'), ff = d.fields.indexOf('footprint');
-  const rnd = random(4242);
+  let rnd = random(0);
   const piles: THREE.Matrix4[] = [], logs: THREE.Matrix4[] = [], twigs: THREE.Matrix4[] = [];
   const q = new THREE.Quaternion(), e = new THREE.Euler(), s = new THREE.Vector3(), p = new THREE.Vector3();
   /** A cylinder lying at (x, z), `lift` over the ground, turned any way, tilted a little. */
@@ -35,6 +26,7 @@ export async function buildDebris(scene: ScenePackage, heightAt: (x: number, z: 
     const o = i * st;
     const x = d.data[o + fx], z = -d.data[o + fy];
     const foot = Math.max(1, ff >= 0 ? d.data[o + ff] : 3);
+    rnd = random(geometrySeed(d.data[o + fx], d.data[o + fy]));
     const ground = Number.isFinite(d.data[o + fz]) && fz >= 0 ? Math.min(d.data[o + fz], heightAt(x, z)) : heightAt(x, z);
     // the mat: a low, turned, ragged dome of fine slash
     const h = 0.12 + foot * (0.03 + rnd() * 0.05);

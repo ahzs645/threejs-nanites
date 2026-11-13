@@ -17,11 +17,16 @@
 //   in  { type: 'pgmaps-camera', position: [x, y, z], bearingDegrees, pitchDegrees, verticalFovDegrees }
 //                                          the eye in the frame of the latest package sent (local metres, z up). One
 //                                          that arrives while a package builds is kept, the latest, and applied after.
-//   in  { type: 'pgmaps-environment', dateTime, latitude, longitude, ground: 'bare' | 'snow', weather: 'clear' |
-//         'overcast' | 'rain' | 'snow' }   before or after a package; the latest is kept for every later build and
-//                                          applied without rebuilding (the sun from the date and place).
+//   in  { type: 'pgmaps-environment', dateTime, timeZone?, utc?, sun?: 'true' | 'daylight', sunPosition?, latitude, longitude,
+//         ground: 'bare' | 'snow', weather: 'clear' | 'overcast' | 'rain' | 'snow' }   before or after a package; the
+//                                          latest is kept for every later build and applied without rebuilding (the
+//                                          sun the parent's `sunPosition`, else from the instant, `utc` before `dateTime`, and the place; 'true' lights
+//                                          from the real sun and not at all once it has set, 'daylight' or none holds
+//                                          the light 6 degrees up).
 //   out { type: 'pgmaps-engine-ready', engine: 'nanite' }   the first frame of a (new) package is drawn
-//   out { type: 'pgmaps-engine-stats', engine: 'nanite', drawn, fps, clusters, impostors, splats, stems }  about 1 s
+//   out { type: 'pgmaps-engine-stats', engine: 'nanite', drawn, fps, clusters, impostors, splats, stems,
+//         crownErrorMean, crownErrorP90, sun: { elevation, azimuth, drawnElevation, drawnAzimuth, exposure, mode } }
+//                                          about 1 s (crown errors: |stem crown width / drawn - 1|; degrees to 0.1)
 //   out { type: 'pgmaps-engine-error', engine: 'nanite', message }
 //
 // The package is local metres: x east, y north, z up (heights absolute). Here y is up and north is -z.
@@ -41,7 +46,7 @@ import { buildTerrain, buildMasks } from './pgmaps/terrain.ts';
 import { floorMaterial } from './pgmaps/floor.ts';
 import { buildDebris } from './pgmaps/debris.ts';
 import { buildWater } from './pgmaps/water.ts';
-import { createEnvironment } from './pgmaps/environment.ts';
+import { createEnvironment, type SunReport } from './pgmaps/environment.ts';
 import { createParticles } from './pgmaps/particles.ts';
 import { DEFAULT_ENVIRONMENT, environmentFromUrl, parseEnvironment, type Environment, type ScenePackage } from './pgmaps/package.ts';
 
@@ -228,8 +233,9 @@ async function build(scene: ScenePackage, env0: Environment): Promise<Drawing> {
   addEventListener('resize', resize);
   resize();
 
+  let sunReport: SunReport | null = null;
   const setEnvironment = (env: Environment): void => {
-    const sun = envr.apply(env, scene.origin);
+    const sun = (sunReport = envr.apply(env, scene.origin));
     particles.set(env.weather === 'rain' || env.weather === 'snow' ? env.weather : null);
     water?.update();
     state.environment = { ...env, sunElevation: +sun.elevation.toFixed(2), sunAzimuth: +sun.azimuth.toFixed(2) };
@@ -304,6 +310,7 @@ async function build(scene: ScenePackage, env0: Environment): Promise<Drawing> {
           toParent({
             type: 'pgmaps-engine-stats', drawn: s.instances + s.impostors, fps: Math.round(fps),
             clusters: s.instances, impostors: s.impostors, splats: s.splats ?? 0, stems: scene.trees.count,
+            crownErrorMean: +stand.residual.mean.toFixed(4), crownErrorP90: +stand.residual.p90.toFixed(4), sun: sunReport,
           });
         }
       }, () => (reading = null));

@@ -1,6 +1,7 @@
 // The sky, fog, sun and shadow map, set by the parent's environment (package.ts): the sun placed from the date and
-// place (below the horizon: a dim dusk, never black), clear (the demo's sky, sun shadows, god rays), overcast (a grey
-// sky, no hard shadows, flat light) or rain / snow (overcast, nearer fog and falling particles, particles.ts). The
+// place (below the horizon: a dim dusk, never black), its light held 6 degrees up under `sun: 'daylight'` (the
+// default) or from the real sun under `sun: 'true'` (none, and no shadows, once it has set); clear (the demo's sky,
+// sun shadows, god rays), overcast (a grey sky, no hard shadows, flat light) or rain / snow (overcast, nearer fog and falling particles, particles.ts). The
 // fog takes the sky's own colour in the view direction, as the demo's (src/lighting.ts), so far ground melts into the
 // sky rather than meeting it at a band. Changing the environment never rebuilds the drawing: only uniforms, the
 // lights and a new sky capture.
@@ -14,6 +15,9 @@ import { PHASE2_LAYER, type Float, type Vec3 } from '../../src/nanite-lib/index.
 import { sunFor, type Environment, type ScenePackage } from './package.ts';
 
 const SKY_SCALE = 18000;
+
+/** The sun as computed and as drawn (degrees, to 0.1): the stats message's `sun`. */
+export interface SunReport { elevation: number; azimuth: number; drawnElevation: number; drawnAzimuth: number; exposure: number; mode: 'true' | 'daylight' }
 /** The shadow map: its side (texels) and half-extent across the sun (m), in front of the eye. */
 const params = new URLSearchParams(location.search);
 const SHADOW_SIZE = Number(params.get('smap') ?? 4096), SHADOW_HALF = Number(params.get('shalf') ?? 220);
@@ -75,7 +79,8 @@ export function createEnvironment(scene: THREE.Scene, heightAt: (x: number, z: n
   for (const l of [hemi, sun]) l.layers.enable(PHASE2_LAYER);
   scene.add(hemi, sun, sun.target);
 
-  /** Towards the sun as the sky draws it, and as the light comes (held a few degrees up at dusk: no grazing shadows). */
+  /** Towards the sun as the sky draws it, and as the light comes (under 'daylight', held a few degrees up at dusk: no
+   * grazing shadows; under 'true', the real sun, below the horizon too, when the light is off). */
   const sunDir = new THREE.Vector3(0, 1, 0), lightDir = new THREE.Vector3(0, 1, 0);
   const snow = uniform(0); // (the ground's and the crowns' snow: floor.ts, the stand's look)
   const wet = uniform(0); // (rain: the ground darker and glossier)
@@ -117,7 +122,9 @@ export function createEnvironment(scene: THREE.Scene, heightAt: (x: number, z: n
     sun.shadow.normalBias = texel;
     sun.shadow.bias = (-texel * sinE) / (2 * back());
     const tx = (2 * SH) / SHADOW_SIZE, ty = (2 * SV) / SHADOW_SIZE;
-    const lx = new THREE.Vector3().crossVectors(new THREE.Vector3(0, 1, 0), lightDir).normalize();
+    const lx = new THREE.Vector3().crossVectors(new THREE.Vector3(0, 1, 0), lightDir);
+    if (lx.lengthSq() < 1e-10) lx.set(1, 0, 0); // (a sun straight overhead)
+    lx.normalize();
     const ly = new THREE.Vector3().crossVectors(lightDir, lx);
     const fx = Math.round(focus.dot(lx) / tx) * tx, fy = Math.round(focus.dot(ly) / ty) * ty, fz = focus.dot(lightDir);
     focus.copy(lx).multiplyScalar(fx).addScaledVector(ly, fy).addScaledVector(lightDir, fz);
@@ -130,22 +137,26 @@ export function createEnvironment(scene: THREE.Scene, heightAt: (x: number, z: n
 
   let recapture = true, exposure = 0.9;
   /** Sets the environment (any time: before the first frame or between frames). */
-  function apply(env: Environment, origin: ScenePackage['origin']): { elevation: number; azimuth: number } {
+  function apply(env: Environment, origin: ScenePackage['origin']): SunReport {
     const pos = sunFor(env, origin);
+    const mode = env.sun ?? 'daylight', trueSun = mode === 'true';
     look = WEATHER[env.weather];
     const rad = Math.PI / 180;
     const dirOf = (el: number, out: THREE.Vector3) => out.set(Math.sin(pos.azimuth * rad) * Math.cos(el * rad), Math.sin(el * rad), -Math.cos(pos.azimuth * rad) * Math.cos(el * rad));
     dirOf(Math.max(pos.elevation, -1), sunDir); // (the sky's glow stays at dusk; SkyMesh is black under ~-2 degrees)
-    dirOf(Math.max(pos.elevation, 6), lightDir);
+    const drawnElevation = trueSun ? pos.elevation : Math.max(pos.elevation, 6);
+    dirOf(drawnElevation, lightDir);
+    /** Direct sunlight: none under the horizon with the true sun. */
+    const up = trueSun ? (pos.elevation > 0 ? 1 : 0) : 1;
     sky.sunPosition.value.copy(sunDir);
     sky2.sunPosition.value.copy(sunDir);
     const day = THREE.MathUtils.smoothstep(pos.elevation, -4, 10); // (0 dusk, 1 day)
     const low = THREE.MathUtils.smoothstep(pos.elevation, 2, 28); // (0 a low warm sun)
     sun.color.setRGB(1, 0.5 + 0.45 * low, 0.28 + 0.58 * low);
-    sun.intensity = look.sun * day;
+    sun.intensity = look.sun * day * up;
     hemi.intensity = look.hemi * (0.32 + 0.68 * THREE.MathUtils.smoothstep(pos.elevation, -8, 18));
     hemi.color.setRGB(0.74 - 0.2 * (1 - day), 0.83 - 0.12 * (1 - day), 0.93);
-    castShadows = look.shadows && day > 0.15;
+    castShadows = look.shadows && day > 0.15 && up > 0;
     sun.shadow.intensity = castShadows ? 1 : 0;
     shadowOn.value = castShadows ? 1 : 0;
     sun.shadow.needsUpdate = true;
@@ -168,7 +179,8 @@ export function createEnvironment(scene: THREE.Scene, heightAt: (x: number, z: n
     exposure = look.exposure * (1 + 0.9 * (1 - day)) * (env.ground === 'snow' ? 0.72 : 1);
     wet.value = env.weather === 'rain' ? 1 : 0;
     recapture = true;
-    return pos;
+    const r1 = (v: number) => Math.round(v * 10) / 10;
+    return { elevation: r1(pos.elevation), azimuth: r1(pos.azimuth), drawnElevation: r1(drawnElevation), drawnAzimuth: r1(pos.azimuth), exposure: +exposure.toFixed(3), mode };
   }
 
   /** Per frame, before the scene is drawn: the sky capture when the environment changed, and the shadow map. */
