@@ -358,7 +358,18 @@ async function loadScene(): Promise<ScenePackage> {
   const input = document.getElementById('file') as HTMLInputElement;
   input.hidden = false;
   return new Promise((resolve) => {
-    input.onchange = async () => resolve(JSON.parse(await input.files![0].text()));
+    input.onchange = async () => {
+      const file = input.files?.[0];
+      if (!file) return;
+      try {
+        const scene = JSON.parse(await file.text()) as ScenePackage;
+        input.hidden = true;
+        resolve(scene);
+      } catch {
+        info.textContent = 'Could not read that file as JSON. Choose a PGMaps scene package.';
+        input.value = '';
+      }
+    };
   });
 }
 
