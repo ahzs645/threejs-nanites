@@ -71,7 +71,7 @@ async function slot<T>(run: () => Promise<T>): Promise<T> {
  */
 const POOL_IDLE_MS = 30_000;
 const idle: Worker[] = [];
-let idleTimer = 0;
+let idleTimer: ReturnType<typeof setTimeout> | undefined;
 const pool = { spawned: 0, jobs: 0 };
 /** One type grown in a worker of the pool (at most MAX_GROWING at once). */
 function grow(job: Omit<GrowJob, 'id'>, id: number): Promise<GrowReply> {
@@ -87,7 +87,7 @@ function grow(job: Omit<GrowJob, 'id'>, id: number): Promise<GrowReply> {
       worker.onmessage = worker.onerror = null;
       idle.push(worker);
       clearTimeout(idleTimer);
-      idleTimer = window.setTimeout(() => idle.splice(0).forEach((x) => x.terminate()), POOL_IDLE_MS);
+      idleTimer = setTimeout(() => idle.splice(0).forEach((x) => x.terminate()), POOL_IDLE_MS);
       resolve(e.data);
     };
     worker.onerror = (e) => (worker.terminate(), reject(new Error(`tree worker: ${e.message}`))); // (not kept: its state is unknown)
@@ -170,7 +170,7 @@ function growType(job: Omit<GrowJob, 'id'>, id: number): Promise<GrowReply> {
 }
 
 // (for the trial: the pool's and the cache's counters, emptying the cache, and the replies this page holds by job)
-Object.assign(window, {
+Object.assign(globalThis, {
   pgmapsTrees: {
     stats: async () => ({ cache: TREE_CACHE, pool: { ...pool, idle: idle.length }, store: (await treeStore())?.stats() ?? null, namespace }),
     clear: async () => (await treeStore())?.clear() ?? false,

@@ -3,3 +3,4 @@ dist
 tools/out
 tools/tmp
 dist-pgmaps
+dist-pgmaps-worker

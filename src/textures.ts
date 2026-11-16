@@ -15,7 +15,7 @@ export function loadLayer(url: string, size: number, leaf = false): Promise<Laye
       else resolve(e.data);
     };
     w.onerror = (e) => reject(workerError(`texture-worker (${url})`, e));
-    const job: LayerJob = { url: url === 'stone' ? url : new URL(url, document.baseURI).href, size, leaf };
+    const job: LayerJob = { url: url === 'stone' ? url : new URL(url, typeof document === 'undefined' ? location.href : document.baseURI).href, size, leaf };
     w.postMessage(job);
   });
 }

@@ -109,6 +109,7 @@ import {
   captureMissing, classPixels, classRasterKey, framePoints, linearDepth, stemClasses, paddedRow, pinholePose, rasterizeClassLayers, readCaptureRequest, unpadRows,
   type CaptureFrame, type CaptureLayer, type CaptureRequest, type ClassGrid, type Rgb, type SeenGround,
 } from './pgmaps/capture-math.ts';
+import { host } from './pgmaps/host.ts';
 
 declare const __NANITE_VERSION__: string | undefined;
 /** This build's version: the package's and the commit's (vite.config.ts). */
@@ -119,14 +120,13 @@ const FINAL_WARM = 6;
 const GRADE_FROM = 1200, GRADE_TO = 4000;
 const FINAL_SHADOW_HALF = 600;
 
-const info = document.getElementById('info')!;
+// (a worker's location is its script's address, with the options PGMaps put on it: `?embed&treecache=1`)
 const params = new URLSearchParams(location.search);
 const ENGINE = 'nanite';
-const embedded = window.parent !== window;
-if (params.has('embed')) info.hidden = true;
-const toParent = (message: Record<string, unknown>): void => {
-  if (embedded) window.parent.postMessage({ engine: ENGINE, ...message }, '*');
-};
+const embedded = host.embedded;
+const toParent = (message: Record<string, unknown>, transfer: Transferable[] = []): void => host.post({ engine: ENGINE, ...message }, transfer);
+/** The orbit controls a page opened alone looks round with; in a worker (no DOM events), a stand-in that holds the target. */
+type Controls = { enabled: boolean; target: THREE.Vector3; update: () => unknown; dispose: () => void };
 
 type CameraMessage = { position: [number, number, number]; bearingDegrees: number; pitchDegrees: number; verticalFovDegrees?: number; projection?: CameraProjection };
 type Drawing = {
@@ -255,8 +255,8 @@ async function show(scene: ScenePackage, keyOnly: string | null = null): Promise
 
 function fail(error: unknown): void {
   const message = error instanceof Error ? error.message : String(error);
-  info.textContent = `failed: ${message}`;
-  Object.assign(window, { pgmaps: { ready: true, error: message } });
+  host.status(`failed: ${message}`);
+  host.expose({ pgmaps: { ready: true, error: message } });
   toParent({ type: 'pgmaps-engine-error', message });
 }
 
@@ -283,10 +283,9 @@ addEventListener('message', (event: MessageEvent) => {
     latestCamera = data as CameraMessage;
     if (current && !building) current.setEye(latestCamera);
   } else if (data?.type === 'pgmaps-capture') {
-    const source = (event.source as Window | null) ?? window.parent;
-    void capture(data, source).then(
-      (reply) => source.postMessage(reply, { targetOrigin: '*', transfer: reply.frames.flatMap((f) => [f.classes.buffer, f.screened.buffer, f.depth.buffer, ...(f.zones ? [f.zones.buffer] : [])]) }),
-      (error: unknown) => source.postMessage({ type: 'pgmaps-engine-capture', engine: ENGINE, id: typeof data.id === 'string' ? data.id : null, error: error instanceof Error ? error.message : String(error) }, '*'),
+    void capture(data, true).then(
+      (reply) => toParent(reply, reply.frames.flatMap((f) => [f.classes.buffer, f.screened.buffer, f.depth.buffer, ...(f.zones ? [f.zones.buffer] : [])])),
+      (error: unknown) => toParent({ type: 'pgmaps-engine-capture', id: typeof data.id === 'string' ? data.id : null, error: error instanceof Error ? error.message : String(error) }),
     );
   } else if (data?.type === 'pgmaps-environment') {
     const env = parseEnvironment(data);
@@ -313,7 +312,8 @@ let captures: Promise<unknown> = Promise.resolve();
  */
 const progress = {
   id: null as string | null,
-  source: null as Window | null,
+  /** The request came from PGMaps (not `window.pgmaps.capture`): its steps are reported. */
+  source: false,
   done: 0,
   total: 0,
   perFrame: 1,
@@ -331,11 +331,11 @@ const progress = {
     if (now - this.sentAt < 250 && this.done < this.total) return;
     this.sentAt = now;
     const stage = `frame ${Math.min(this.total / this.perFrame, Math.floor((this.done - 1) / this.perFrame) + 1)} of ${this.total / this.perFrame}`;
-    this.source.postMessage({ type: 'pgmaps-capture-progress', engine: ENGINE, id: this.id, done: this.done, total: this.total, stage }, '*');
+    toParent({ type: 'pgmaps-capture-progress', id: this.id, done: this.done, total: this.total, stage });
   },
 };
 /** A capture request, checked, drawn after any capture before it. */
-function capture(data: unknown, source: Window | null = null): Promise<CaptureReply> {
+function capture(data: unknown, source = false): Promise<CaptureReply> {
   const run = captures.then(async () => {
     const request = readCaptureRequest(data);
     progress.id = source ? request.id : null;
@@ -344,7 +344,7 @@ function capture(data: unknown, source: Window | null = null): Promise<CaptureRe
       return await (await drawn()).capture(request);
     } finally {
       progress.id = null;
-      progress.source = null;
+      progress.source = false;
     }
   });
   captures = run.catch(() => undefined);
@@ -354,7 +354,7 @@ function capture(data: unknown, source: Window | null = null): Promise<CaptureRe
 async function loadScene(): Promise<ScenePackage> {
   const url = params.get('scene');
   if (url) return (await fetch(url)).json();
-  info.textContent = 'choose a PGMaps scene package (forestry-scene-package.json)';
+  host.status('choose a PGMaps scene package (forestry-scene-package.json)');
   const input = document.getElementById('file') as HTMLInputElement;
   input.hidden = false;
   return new Promise((resolve) => {
@@ -442,25 +442,28 @@ async function build(scene: ScenePackage, env0: Environment): Promise<Drawing> {
   const adapter = await navigator.gpu?.requestAdapter({ powerPreference: 'high-performance' });
   const lim = adapter?.limits;
   const renderer = new THREE.WebGPURenderer({
-    antialias: false, powerPreference: 'high-performance',
+    canvas: host.canvas(), antialias: false, powerPreference: 'high-performance',
     ...(lim ? { requiredLimits: { maxBufferSize: lim.maxBufferSize, maxStorageBufferBindingSize: lim.maxStorageBufferBindingSize, maxStorageBuffersPerShaderStage: lim.maxStorageBuffersPerShaderStage, maxSampledTexturesPerShaderStage: lim.maxSampledTexturesPerShaderStage } } : {}),
   });
   await renderer.init();
   if (!(renderer.backend as unknown as { isWebGPUBackend?: boolean }).isWebGPUBackend) throw new Error('this example needs WebGPU (compute)');
-  renderer.setPixelRatio(Math.min(devicePixelRatio, 1.5));
-  renderer.setSize(innerWidth, innerHeight);
+  const view0 = host.viewport();
+  renderer.setPixelRatio(Math.min(view0.pixelRatio, 1.5));
+  // (an OffscreenCanvas has no style to size: PGMaps sizes and places the element it handed over)
+  renderer.setSize(view0.width, view0.height, !host.worker);
   renderer.shadowMap.enabled = true;
   renderer.shadowMap.type = THREE.PCFShadowMap;
   renderer.toneMapping = THREE.ACESFilmicToneMapping;
-  document.body.appendChild(renderer.domElement);
-  if (embedded || params.has('embed')) renderer.domElement.style.pointerEvents = 'none';
+  host.mount(renderer.domElement);
   built.lap('device');
 
   const three = new THREE.Scene();
   const { camera: eye } = scene;
-  const camera = new THREE.PerspectiveCamera(eye.verticalFovDegrees, innerWidth / innerHeight, 0.3, 30000);
-  const controls = new OrbitControls(camera as never, renderer.domElement);
-  controls.enabled = !params.has('embed'); // (embedded, the parent drives the camera)
+  const camera = new THREE.PerspectiveCamera(eye.verticalFovDegrees, view0.width / view0.height, 0.3, 30000);
+  const controls: Controls = host.worker
+    ? { enabled: false, target: new THREE.Vector3(), update: () => false, dispose: () => {} }
+    : new OrbitControls(camera as never, renderer.domElement as HTMLCanvasElement);
+  controls.enabled = !params.has('embed') && !host.worker; // (embedded, the parent drives the camera)
   let savedProjection = eye.projection;
   let updateViewport = (): void => {};
   /** The package's eye (local metres, z up, bearing clockwise from north) as the camera and the orbit's target. */
@@ -657,19 +660,24 @@ async function build(scene: ScenePackage, env0: Environment): Promise<Drawing> {
   const size = new THREE.Vector2();
   let viewWidth = 0, viewHeight = 0;
   const resize = (): void => {
-    const view = fitCameraViewport(savedProjection, innerWidth, innerHeight);
+    const box = host.viewport();
+    const view = fitCameraViewport(savedProjection, box.width, box.height);
+    if (Math.min(box.pixelRatio, 1.5) !== renderer.getPixelRatio()) {
+      renderer.setPixelRatio(Math.min(box.pixelRatio, 1.5));
+      viewWidth = 0; // (the drawing buffer changes size with it)
+    }
     camera.aspect = view.aspect;
     camera.updateProjectionMatrix();
     if (viewWidth !== view.width || viewHeight !== view.height) {
-      renderer.setSize(view.width, view.height);
+      renderer.setSize(view.width, view.height, !host.worker);
       renderer.getDrawingBufferSize(size);
       sceneRT.setSize(size.x, size.y);
       viewWidth = view.width; viewHeight = view.height;
     }
-    Object.assign(renderer.domElement.style, { position: 'absolute', left: `${view.left}px`, top: `${view.top}px` });
+    host.place(renderer.domElement, view);
   };
   updateViewport = resize;
-  addEventListener('resize', resize);
+  const unlistenResize = host.onResize(resize);
   resize();
 
   let sunReport: SunReport | null = null;
@@ -699,7 +707,7 @@ async function build(scene: ScenePackage, env0: Environment): Promise<Drawing> {
     frames: 0, nanite, camera, controls, scene: three, ready: false, residual: stand.residual, buildMs: 0, environment: null, cover: coverReport, timing, atlasDigests,
     debug: { envr, rays, taa, terrain, reliefSteps, noShadows: false, noRays: false },
   };
-  Object.assign(window, { pgmaps: state });
+  host.expose({ pgmaps: state });
   setEnvironment(env0);
   const t1 = performance.now();
   /**
@@ -766,9 +774,9 @@ async function build(scene: ScenePackage, env0: Environment): Promise<Drawing> {
       reading = nanite.readStats().then((s) => {
         reading = null;
         if (!s || disposed) return;
-        info.textContent = `${scene.trees.count.toLocaleString()} stems, ${types.length} tree types (${stand.residual.lines.length - types.length} species)\n` +
+        host.status(`${scene.trees.count.toLocaleString()} stems, ${types.length} tree types (${stand.residual.lines.length - types.length} species)\n` +
           `drawn: ${s.instances.toLocaleString()} as clusters, ${s.impostors.toLocaleString()} impostors, ${(s.splats ?? 0).toLocaleString()} splats\n` +
-          `crown width off by ${(stand.residual.mean * 100).toFixed(1)}% mean, ${(stand.residual.p90 * 100).toFixed(1)}% p90`;
+          `crown width off by ${(stand.residual.mean * 100).toFixed(1)}% mean, ${(stand.residual.p90 * 100).toFixed(1)}% p90`);
         state.ready = state.frames > 10;
         if (time - lastPost >= 1) {
           lastPost = time;
@@ -1211,11 +1219,11 @@ async function build(scene: ScenePackage, env0: Environment): Promise<Drawing> {
       disposed = true;
       renderer.setAnimationLoop(null);
       await reading?.catch(() => undefined);
-      removeEventListener('resize', resize);
+      unlistenResize();
       controls.dispose();
       // (destroys the WebGPU device this renderer made: every buffer, texture and pipeline of this package with it)
       await renderer.dispose();
-      renderer.domElement.remove();
+      host.unmount(renderer.domElement);
     },
   };
 }
@@ -1258,7 +1266,7 @@ async function captureUrls(reply: CaptureReply): Promise<Array<Record<string, st
 
 /** The package's own view, one 960 x 540 frame at 60 degrees across, and a 200 m square class layer (`&captureAhead=` m ahead, 150). */
 async function captureTest(): Promise<void> {
-  while (!(current && currentScene && (window as unknown as { pgmaps?: { ready?: boolean } }).pgmaps?.ready)) await new Promise((resolve) => setTimeout(resolve, 250));
+  while (!(current && currentScene && (globalThis as unknown as { pgmaps?: { ready?: boolean } }).pgmaps?.ready)) await new Promise((resolve) => setTimeout(resolve, 250));
   const eye = currentScene.camera;
   const b = (eye.bearingDegrees * Math.PI) / 180;
   const ahead = Number(params.get('captureAhead') ?? 150); // (its near edge 50 m out: on open ground in the sample packages, the stand over its far part)
@@ -1273,19 +1281,19 @@ async function captureTest(): Promise<void> {
   try {
     const reply = await capture(request);
     const urls = await captureUrls(reply);
-    Object.assign((window as unknown as { pgmaps: Record<string, unknown> }).pgmaps, { lastCaptureRequest: request, lastCapture: reply, captureUrls: urls });
+    Object.assign((globalThis as unknown as { pgmaps: Record<string, unknown> }).pgmaps, { lastCaptureRequest: request, lastCapture: reply, captureUrls: urls });
     console.info('captureTest', reply.timings, urls);
   } catch (error) {
     console.error(error);
-    Object.assign((window as unknown as { pgmaps: Record<string, unknown> }).pgmaps, { lastCaptureError: error instanceof Error ? error.message : String(error) });
+    Object.assign((globalThis as unknown as { pgmaps: Record<string, unknown> }).pgmaps, { lastCaptureError: error instanceof Error ? error.message : String(error) });
   }
 }
 if (params.has('captureTest')) void captureTest();
-Object.assign(window, { pgmapsCaptureUrls: captureUrls });
+host.expose({ pgmapsCaptureUrls: captureUrls });
 
 if (params.has('scene') || !embedded) loadScene().then(show, fail);
 else {
-  info.textContent = 'waiting for a scene from the parent page';
+  host.status('waiting for a scene from the parent page');
   toParent({ type: 'pgmaps-engine-hello', accepts: [...ACCEPTS] });
 }
 

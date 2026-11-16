@@ -54,10 +54,15 @@ function pgmapsTextures(): Plugin {
 }
 
 export default defineConfig(({ mode }) => {
-  const pgmapsOnly = mode === 'pgmaps';
+  // `--mode pgmaps-worker` (npm run build:pgmaps-worker): the scene as a worker PGMaps starts itself
+  // (examples/pgmaps-worker.ts), built the same way as the page, to dist-pgmaps-worker/pgmaps-engine.js
+  const asWorker = mode === 'pgmaps-worker';
+  const pgmapsOnly = mode === 'pgmaps' || asWorker;
   // the demo, and the library's example (examples/gltf.html: a glTF scene through src/nanite-lib/ alone); or the PGMaps
   // scene page alone
-  const input: Record<string, string> = pgmapsOnly
+  const input: Record<string, string> = asWorker
+    ? { 'pgmaps-engine': path('./examples/pgmaps-worker.ts') }
+    : pgmapsOnly
     ? { pgmaps: path('./examples/pgmaps-scene.html') }
     : { main: path('./index.html'), gltf: path('./examples/gltf.html'), pgmaps: path('./examples/pgmaps-scene.html') };
   return {
@@ -78,8 +83,10 @@ export default defineConfig(({ mode }) => {
     worker: { format: 'es', plugins: () => [ezTreeWithoutTextures()] }, // (ez-tree grows in the DAG worker)
     build: {
       target: 'es2022',
-      ...(pgmapsOnly ? { outDir: path('./dist-pgmaps'), emptyOutDir: true } : {}),
-      rolldownOptions: { input },
+      ...(pgmapsOnly ? { outDir: path(asWorker ? './dist-pgmaps-worker' : './dist-pgmaps'), emptyOutDir: true } : {}),
+      // (a worker has no document for module preloads to add links to; the entry keeps a stable name PGMaps loads)
+      ...(asWorker ? { modulePreload: false as const } : {}),
+      rolldownOptions: { input, ...(asWorker ? { output: { entryFileNames: '[name].js' } } : {}) },
     },
     // (the harness's scratch and output: browser profiles left by hung runs are ~100k files, and watching them held
     // up the dev server's first requests for minutes)
