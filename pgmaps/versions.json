@@ -1,4 +1,14 @@
 {
-  "latest": null,
-  "versions": []
+  "latest": "1.0.0",
+  "versions": [
+    {
+      "version": "1.0.0",
+      "tag": "pgmaps-scene-v1.0.0",
+      "commit": "3da72e35d255422735b69b9e7e714975a8dda684",
+      "engine": "pgmaps-scene 1.0.0+3da72e3",
+      "built": "2026-11-16T01:26:49Z",
+      "published": "2026-11-16T01:26:53Z",
+      "page": "pgmaps/1.0.0/pgmaps-scene.html"
+    }
+  ]
 }
