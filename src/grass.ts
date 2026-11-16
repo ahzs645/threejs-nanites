@@ -31,7 +31,7 @@ const TILES = Number(params.get('grasstiles') ?? 8); // tiles a side per ring
 /** The rings: cell size (m), outer radius (m) and segments per blade (2 x segs + 1 vertices, 2 x segs - 1 triangles:
  * the far rings' blades are a few pixels tall and need no curve, and most blades are there); each fades in over the
  * last 20% of the ring inside it. */
-const TOUCH = matchMedia('(pointer: coarse)').matches;
+const TOUCH = (typeof matchMedia === 'function' && matchMedia('(pointer: coarse)').matches);
 const SCALE = Number(params.get('grass') ?? (TOUCH ? 0.5 : 1)); // ring radii, x (0 = no grass)
 const RINGS = [
   { cell: 0.09, radius: 16, segs: 4 },

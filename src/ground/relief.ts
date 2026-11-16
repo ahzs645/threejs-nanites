@@ -11,7 +11,7 @@ import type { Float, Vec2 } from '../types.ts';
 const MAX_STEPS = 32;
 /** Steps down the view ray (looking straight down takes half); 0 turns the relief off (`?relief=0`; off on touch). */
 const params = new URLSearchParams(location.search);
-export const reliefSteps = uniform(Number(params.get('relief') ?? (matchMedia('(pointer: coarse)').matches ? 0 : MAX_STEPS)));
+export const reliefSteps = uniform(Number(params.get('relief') ?? ((typeof matchMedia === 'function' && matchMedia('(pointer: coarse)').matches) ? 0 : MAX_STEPS)));
 export const RELIEF_STEPS = MAX_STEPS;
 
 export interface Relief {

@@ -77,7 +77,7 @@ export interface TreeInstances {
 }
 
 /** Undergrowth per tree (`?bushes=`; 0.5 on touch screens): instances of the bush variants in the same buffers. */
-const BUSHES_PER_TREE = Number(params.get('bushes') ?? (matchMedia('(pointer: coarse)').matches ? 0.5 : 1.5));
+const BUSHES_PER_TREE = Number(params.get('bushes') ?? ((typeof matchMedia === 'function' && matchMedia('(pointer: coarse)').matches) ? 0.5 : 1.5));
 
 /** The Lucy scene's statues (`?lucys=`): 250k of her 4M-triangle copy (lucy4m.nm), 1T triangles at full detail. */
 const LUCYS = Number(params.get('lucys') ?? 250000);

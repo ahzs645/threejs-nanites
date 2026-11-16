@@ -460,8 +460,11 @@ async function build(scene: ScenePackage, env0: Environment): Promise<Drawing> {
   const three = new THREE.Scene();
   const { camera: eye } = scene;
   const camera = new THREE.PerspectiveCamera(eye.verticalFovDegrees, view0.width / view0.height, 0.3, 30000);
+  // (OrbitControls' update turns the camera to its target even when disabled: that is what aims the parent's eye, so
+  // the worker's stand-in does the same)
+  const target = new THREE.Vector3();
   const controls: Controls = host.worker
-    ? { enabled: false, target: new THREE.Vector3(), update: () => false, dispose: () => {} }
+    ? { enabled: false, target, update: () => camera.lookAt(target), dispose: () => {} }
     : new OrbitControls(camera as never, renderer.domElement as HTMLCanvasElement);
   controls.enabled = !params.has('embed') && !host.worker; // (embedded, the parent drives the camera)
   let savedProjection = eye.projection;
