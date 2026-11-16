@@ -16,7 +16,7 @@
 // What's the application's comes in through `look` (gpu/look.ts: a world-space curve, vertex motion, colours) and the
 // types, instances and textures it passes (NaniteType, NaniteInstances, NaniteTextures in gpu/types.ts).
 import * as THREE from 'three/webgpu';
-import { uniform, bitcast, float } from 'three/tsl';
+import { uniform, bitcast, float, texture, ivec2, int, select } from 'three/tsl';
 import type { StorageBufferNode, UniformArrayNode } from 'three/webgpu';
 import { SoftRaster } from './softraster.ts';
 import { Splats } from './splats.ts';
@@ -31,12 +31,14 @@ import { computeBatch } from '../three-gaps.ts';
 import { InstanceChunks, CHUNK } from './chunks.ts';
 import { defaultLook, type NaniteLook } from './look.ts';
 import type { DagStats } from '../dag/types.ts';
-import type { Float, Uint, UVec4 } from '../types.ts';
+import type { Float, Uint, UVec4, Vec3 } from '../types.ts';
 import type { Counters, NaniteInstances, NaniteStats, NaniteTextures, NaniteType, NaniteUniforms, View } from './types.ts';
 import type { Hzb } from './hzb.ts';
 import { ListGuard } from './list-guard.ts';
 
 type TypeStats = DagStats & { name: string; radius: number };
+/** Trees a row of the class-pass colour texture (setInstanceClasses). */
+const CLASS_ROW = 2048;
 
 const CAST_CULL = new URLSearchParams(location.search).get('castcull') !== '0'; // (?castcull=0: every caster in the map)
 const CAST_SLACK = 60; // m: how much lower than a tree's base its shadow may land (a slope)
@@ -102,6 +104,14 @@ export class NaniteRenderer {
   readonly mainGuard: ListGuard;
   readonly shadowGuard: ListGuard;
   readonly group: THREE.Group;
+  /**
+   * Debug 7's colour per tree (setInstanceClasses): RGBA8 texels in instance order, CLASS_ROW a row; `classPerTree` 1
+   * while one is set, else every tree takes u.classColour.
+   */
+  readonly classTex: THREE.TextureNode;
+  readonly classPerTree = uniform(0, 'uint');
+  /** (one texture for the renderer's life, its texels rewritten: a texture swapped under a built pipeline drew no trees) */
+  private readonly classData: THREE.DataTexture;
 
   /** `types`: the mesh types, in the order the instances' b.z refers to them; `look`: see gpu/look.ts. */
   constructor(renderer: THREE.WebGPURenderer, types: NaniteType[], instances: NaniteInstances, textures: NaniteTextures, look: NaniteLook = defaultLook()) {
@@ -117,12 +127,19 @@ export class NaniteRenderer {
       time: uniform(0),
       prevTime: uniform(0), // (last frame's: motion vectors)
       debug: uniform(0, 'uint'),
+      classColour: uniform(new THREE.Vector3(1, 1, 1)), // (debug 7, the class pass: every tree's flat colour, shading.ts)
       occlusion: uniform(1, 'uint'), // two-phase occlusion culling on/off
       sunDir: uniform(new THREE.Vector3(0, 1, 0)), // towards the sun (the shadow camera's view, reversed)
       castLen: uniform(0), // how far a caster's shadow can reach from it (m; 0: no test, ?castcull=0; see CastTest)
     };
     this.textures = textures;
     this._buildBuffers(types, instances);
+    const rows = Math.max(1, Math.ceil(this.instanceCount / CLASS_ROW));
+    this.classData = new THREE.DataTexture(new Uint8Array(CLASS_ROW * rows * 4), CLASS_ROW, rows);
+    this.classData.magFilter = this.classData.minFilter = THREE.NearestFilter;
+    this.classData.generateMipmaps = false;
+    this.classData.needsUpdate = true;
+    this.classTex = texture(this.classData);
     this._buildHzb();
     // (the main view's counters: its draw args, stats, retest and software-raster counts in one buffer, see CTR_SIZE)
     this.mainCtr = makeCounters();
@@ -148,6 +165,28 @@ export class NaniteRenderer {
     }
   }
 
+  /**
+   * Each tree's class-pass colour (debug 7), straight RGB bytes, three a tree in the order of the instances given to the
+   * constructor; null: every tree u.classColour again. An application's class pass gives a tree the class of the ground
+   * it stands on (a landform's own forest is the landform), decided once a tree, in its geometry and impostor alike.
+   */
+  setInstanceClasses(rgb: Uint8Array | null): void {
+    if (!rgb) {
+      this.classPerTree.value = 0;
+      return;
+    }
+    const n = this.instanceCount;
+    if (rgb.length < n * 3) throw new Error(`setInstanceClasses: ${rgb.length / 3} colours for ${n} trees`);
+    const px = this.classData.image.data as Uint8Array;
+    for (let i = 0; i < n; i++) px.set([rgb[i * 3], rgb[i * 3 + 1], rgb[i * 3 + 2], 255], i * 4);
+    this.classData.needsUpdate = true;
+    this.classPerTree.value = 1;
+  }
+  /** Tree i's class-pass colour (debug 7): its own (setInstanceClasses) or u.classColour. */
+  _classColour(i: Uint): Vec3 {
+    const own = this.classTex.load(ivec2(int(i.mod(CLASS_ROW)), int(i.div(CLASS_ROW)))).rgb;
+    return select(this.classPerTree.equal(1), own, this.u.classColour);
+  }
   // ------------------------------------------------------------------ buffer accessors (node -> node)
   /** Tree i's position and scale. */
   _a(i: Uint) {

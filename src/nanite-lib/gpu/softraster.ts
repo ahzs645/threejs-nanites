@@ -27,7 +27,7 @@ import type { NaniteRenderer } from './renderer.ts';
 import type { Bool, Float, Int, Uint, Vec2, Vec3 } from '../types.ts';
 import type { ClusterVertex, Counters, Shading, U } from './types.ts';
 import { setEmissive, asReceivedShadow, floatBits, computeBatch } from '../three-gaps.ts';
-import { makeLeafAlphaLod, ditherAt, ditherAlt, LEAF_COV, LEAF_DITHER, mipBias, unfold, FOLD_FIX } from './shading.ts';
+import { makeLeafAlphaLod, ditherAt, ditherAlt, LEAF_COV, LEAF_DITHER, mipBias, unfold, FOLD_FIX, flatDebug } from './shading.ts';
 
 /** Visibility buffer capacity (pixels of the drawing buffer); a bigger screen falls back to hardware only. */
 export const MAX_PIXELS = 3840 * 2160;
@@ -316,11 +316,11 @@ export class SoftRaster {
     mat.fog = false;
     mat.colorNode = Fn(() => {
       Discard(id.equal(0).and(lost.not()).or(this.on.equal(0)).or(id.greaterThanEqual(uint(SPLAT_BIT)))); // (splats: splats.ts)
-      return vec4(select(lost, vec3(1, 0, 1), select(u.debug.equal(5), SW_DEBUG, select(u.debug.equal(4), vec3(0), select(u.debug.greaterThan(0), dbg, albedo)))), 1);
+      return vec4(select(lost, vec3(1, 0, 1), select(u.debug.equal(5), SW_DEBUG, select(flatDebug(u), vec3(0), select(u.debug.greaterThan(0), dbg, albedo)))), 1);
     })();
     mat.normalNode = normalize(cameraViewMatrix.mul(vec4(normal, 0)).xyz);
     // (leaves: light passing through, as on the hardware-drawn leaves)
-    setEmissive(mat, select(lost, vec3(1, 0, 1), select(u.debug.equal(5), SW_DEBUG, select(u.debug.equal(4), dbg, select(u.debug.greaterThan(0).or(leaf.not()), vec3(0), albedo.mul(0.12))))));
+    setEmissive(mat, select(lost, vec3(1, 0, 1), select(u.debug.equal(5), SW_DEBUG, select(flatDebug(u), dbg, select(u.debug.greaterThan(0).or(leaf.not()), vec3(0), albedo.mul(0.12))))));
     // (a fullscreen pass: off the map, the pixels it discards skip the shadow's 5 taps; a discard doesn't stop the shader)
     mat.receivedShadowPositionNode = select(id.equal(0).or(id.greaterThanEqual(uint(SPLAT_BIT))), vec3(1e7), world);
     mat.receivedShadowNode = asReceivedShadow(shading.fadeShadow(world));

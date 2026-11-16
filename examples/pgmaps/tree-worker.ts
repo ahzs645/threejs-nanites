@@ -6,6 +6,7 @@ import { Tree, Billboard } from '@dgreenheck/ez-tree';
 import { buildDag } from '../../src/nanite-lib/dag/build.ts';
 import type { BarkSource, DagResult, LeafMask, LeafSource } from '../../src/nanite-lib/dag/types.ts';
 import { mergeOptions, type SpeciesLook } from './species.ts';
+import { RATIO_MAX } from './tree-bins.ts';
 
 export interface GrowJob {
   id: number;
@@ -37,6 +38,9 @@ function measure(t: Grown): { ratio: number; top: number } {
   return { ratio: (2 * (r[Math.floor(r.length * 0.95)] ?? 0)) / Math.max(top, 1e-6), top };
 }
 
+// A change here that alters any byte of a job's reply: bump GROW_VERSION (tree-cache-key.ts), or browsers keep
+// serving the trees they cached. (The workers are kept between jobs, trees.ts: nothing here may carry over from one
+// job to the next.)
 function grow(job: GrowJob) {
   const tree = new Tree();
   tree.loadPreset(job.look.preset);
@@ -47,13 +51,15 @@ function grow(job: GrowJob) {
   // the crown's width by its branches' length: a few rounds towards the ratio (ez-tree's growth isn't linear in it)
   const base = { ...o.branch.length };
   const keys = job.look.conifer ? [1] : [1, 2];
+  // (a clump rung past the generator's widest: grown at its widest, the rest scaled across, tree-bins.ts WIDE_STEPS)
+  const target = Math.min(job.ratio, RATIO_MAX);
   let k = 1, m = { ratio: 1, top: 1 };
   for (let round = 0; round < 3; round++) {
     for (const key of keys) o.branch.length[key] = base[key] * k;
     tree.generate();
     m = measure(tree as unknown as Grown);
-    if (Math.abs(m.ratio / job.ratio - 1) < 0.04) break;
-    k = Math.min(4, Math.max(0.2, k * (job.ratio / Math.max(m.ratio, 1e-3)) ** (job.look.conifer ? 1 : 1.25)));
+    if (Math.abs(m.ratio / target - 1) < 0.04) break;
+    k = Math.min(4, Math.max(0.2, k * (target / Math.max(m.ratio, 1e-3)) ** (job.look.conifer ? 1 : 1.25)));
   }
   const grown = m.ratio;
   const squash = job.ratio / Math.max(grown, 1e-3); // (the rest: the tree scaled across)

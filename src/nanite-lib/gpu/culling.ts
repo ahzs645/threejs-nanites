@@ -201,7 +201,8 @@ export const cullingMethods = {
     const main = name === 'main';
     const planeValues = Array.from({ length: 6 }, () => new THREE.Vector4());
     const planes = uniformArray<'vec4'>(planeValues, 'vec4');
-    const chunkValues = Array.from({ length: Math.ceil(this.chunks.count / 2) }, () => new THREE.Vector4());
+    // (at least one pair: a stand with no instances still writes its one empty chunk, InstanceChunks.visible)
+    const chunkValues = Array.from({ length: Math.max(1, Math.ceil(this.chunks.count / 2)) }, () => new THREE.Vector4());
     const ctr = main ? this.mainCtr : makeCounters(); // (the main view's is shared with the software rasterizer)
     const v: ViewBase = {
       name,

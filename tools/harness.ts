@@ -20,6 +20,7 @@ import { zoomTime, flyTime, copyKey } from './harness/zoomtime.ts';
 import { typeMatch } from './harness/typematch.ts';
 import { lodCheck } from './harness/lodcheck.ts';
 import { runExample } from './harness/example.ts';
+import { runPgmapsReplay } from './harness/pgmaps.ts';
 import { status, at } from './harness/status.ts';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
@@ -62,14 +63,17 @@ if (opts.load) {
   await server?.close();
   process.exit(code);
 }
-if (opts.example) {
+if (opts.example || opts.pgmaps) {
   // --example: the library's example page instead of the demo (see harness/example.ts)
   const browser = await launchBrowser();
   let code = 0;
   try {
     const { page, logs, failed } = await openPage(browser, opts);
-    const r = await runExample(page, url, opts.example, opts, outDir);
-    console.log(`${r.info}\nscreenshot ${r.png}`);
+    if (opts.pgmaps) await runPgmapsReplay(page, url, opts.pgmaps, opts.query, outDir);
+    else {
+      const r = await runExample(page, url, opts.example!, opts, outDir);
+      console.log(`${r.info}\nscreenshot ${r.png}`);
+    }
     writeFileSync(join(outDir, 'console.log'), logs.join('\n'));
     if (failed()) code = 1;
   } catch (e) {

@@ -72,6 +72,7 @@ loading
   --verbose          echo the whole page console
 
 the library
+  --pgmaps=<file>    replay a frozen scene JSON at --url=<engine page>; test resizing and reload, save captures
   --example[=gltf]   the library's example page (examples/<name>.html) instead of the demo: its stats line after
                      --frames frames and tools/out/example-<name>.png (harness/example.ts)
 
@@ -133,6 +134,7 @@ export function parseOptions(argv: string[]) {
     resizeDuringLoad: args['resize-during-load'] ? String(args['resize-during-load']).split('x').map(Number) : null,
     verbose: Boolean(args.verbose),
     example: args.example === undefined ? null : args.example === true ? 'gltf' : String(args.example),
+    pgmaps: typeof args.pgmaps === 'string' ? args.pgmaps : null,
   };
   return { ...base, timeout: base.timeout ?? expectedSeconds(base) };
 }

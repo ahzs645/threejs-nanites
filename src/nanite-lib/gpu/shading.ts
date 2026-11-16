@@ -5,7 +5,7 @@ import {
   screenCoordinate, exp2, uniform, fwidth, smoothstep,
 } from 'three/tsl';
 import * as THREE from 'three/webgpu';
-import type { Float, Uint, Vec2, Vec3 } from '../types.ts';
+import type { Bool, Float, Uint, Vec2, Vec3 } from '../types.ts';
 
 /** A texture layer or type index: a uint, or a float holding a whole number. */
 type Index = Uint | Float;
@@ -80,6 +80,21 @@ export const dither = (): Float => ditherAt(screenCoordinate.xy);
  * 50 points of coverage off, a darker band where trees turn into impostors (the user: the switch line on the fog line).
  */
 export const ditherAlt = (xy: Vec2): Float => ditherAt(vec2(xy.y, xy.x).add(vec2(17, 59)));
+
+/**
+ * Debug 7: the class pass (an application's picture of what screens what, as PGMaps' capture asks): every tree one
+ * flat colour (`u.classColour`, emitted: the application turns its lights off), its leaves cut at alpha 0.5 and the
+ * impostor cross-fade split at 0.5, with no dither, so the silhouette is exact and the same every frame.
+ */
+export const CLASS_DEBUG = 7;
+/** Debug 4 or 7: an unlit flat colour (the emissive's). */
+export const flatDebug = (u: { debug: Uint }): Bool => u.debug.equal(4).or(u.debug.equal(CLASS_DEBUG));
+/** Whether a pixel of the share `fade` drawn as geometry keeps it: by the dither, or at 0.5 in the class pass. */
+export const fadeKept = (u: { debug: Uint }, fade: Float, d: Float = dither()): Bool =>
+  select(u.debug.equal(CLASS_DEBUG), float(0.5), d).lessThan(fade);
+/** The leaf's alpha as drawn (`dithered`: a2cDither under TAA), or the plain cut at 0.5 in the class pass. */
+export const leafAlphaDrawn = (u: { debug: Uint }, a: Float, dithered: boolean): Float =>
+  select(u.debug.equal(CLASS_DEBUG), select(a.greaterThanEqual(0.5), float(1), float(0)), dithered ? a2cDither(a) : a);
 
 // debug 4: a flat, unlit colour per tree type, in geometry and impostors alike (harness --typematch masks with it;
 // keep in sync with TYPE_IDS in tools/harness/typematch.ts): ten hues 36 degrees apart, told apart by hue (debug 4

@@ -18,14 +18,23 @@ export const LADDER_STEPS = 10;
 /** The ratio between neighbouring rungs (≈ 1.311). */
 export const LADDER_STEP = (RATIO_MAX / RATIO_MIN) ** (1 / LADDER_STEPS);
 
-/** The ladder's ratios, rung 0 (RATIO_MIN) to rung LADDER_STEPS (RATIO_MAX). */
-export const LADDER: readonly number[] = Array.from({ length: LADDER_STEPS + 1 }, (_, k) => (k === LADDER_STEPS ? RATIO_MAX : RATIO_MIN * LADDER_STEP ** k));
+/**
+ * Clump rungs past RATIO_MAX on the same step, to about 6: a capture's far stems each stand for several trees, with
+ * crowns two to five times as wide as tall (PGMaps' coarse bands). The generator grows RATIO_MAX and the worker scales
+ * it across the rest, so the stem keeps its own crown width.
+ */
+export const WIDE_STEPS = 6;
+/** The widest rung. */
+export const TOP_RUNG = LADDER_STEPS + WIDE_STEPS;
+
+/** The ladder's ratios, rung 0 (RATIO_MIN) to rung LADDER_STEPS (RATIO_MAX), then the clump rungs to TOP_RUNG. */
+export const LADDER: readonly number[] = Array.from({ length: TOP_RUNG + 1 }, (_, k) => (k === LADDER_STEPS ? RATIO_MAX : k > LADDER_STEPS ? RATIO_MAX * LADDER_STEP ** (k - LADDER_STEPS) : RATIO_MIN * LADDER_STEP ** k));
 
 /** The rung nearest a ratio in log terms (ratios past the ends take the end rungs; no ratio, rung 0). */
 export function binOf(ratio: number): number {
   if (!(ratio > 0)) return 0;
   const k = Math.round(Math.log(ratio / RATIO_MIN) / Math.log(LADDER_STEP));
-  return Math.min(LADDER_STEPS, Math.max(0, k));
+  return Math.min(TOP_RUNG, Math.max(0, k));
 }
 
 /** A rung's ratio. */
@@ -42,11 +51,33 @@ export function assignBins(ratios: readonly number[]): { binOf: number[]; bins: 
   return { binOf: of, bins: [...new Set(of)].sort((a, b) => a - b) };
 }
 
-/** Mean and 90th percentile of a list of errors (0 for none). */
-export function errorSummary(errors: readonly number[]): { mean: number; p90: number } {
+/**
+ * Mean and 90th percentile of a list of errors (0 for none). The errors are sorted as doubles in a typed array (no
+ * comparator calls: a final stand's 1.4 M stems took 0.4 s through Array.sort, about 0.06 s this way) and summed in
+ * ascending order, so both figures are bit for bit what the comparator sort gave.
+ */
+export function errorSummary(errors: ArrayLike<number>): { mean: number; p90: number } {
   if (!errors.length) return { mean: 0, p90: 0 };
-  const sorted = errors.slice().sort((a, b) => a - b);
-  return { mean: sorted.reduce((s, e) => s + e, 0) / sorted.length, p90: sorted[Math.floor(sorted.length * 0.9)] ?? 0 };
+  const sorted = Float64Array.from(errors).sort();
+  let sum = 0;
+  for (let i = 0; i < sorted.length; i++) sum += sorted[i];
+  return { mean: sum / sorted.length, p90: sorted[Math.floor(sorted.length * 0.9)] ?? 0 };
+}
+
+/**
+ * The stems in type order, each type's in their own order (a stable counting sort: what
+ * `indices.sort((x, y) => typeOf[x] - typeOf[y])` gives, without a comparator call a stem).
+ */
+export function orderByType(typeOf: ArrayLike<number>): Uint32Array {
+  const n = typeOf.length;
+  let types = 0;
+  for (let i = 0; i < n; i++) if (typeOf[i] >= types) types = typeOf[i] + 1;
+  const start = new Uint32Array(types + 1);
+  for (let i = 0; i < n; i++) start[typeOf[i] + 1]++;
+  for (let t = 0; t < types; t++) start[t + 1] += start[t];
+  const order = new Uint32Array(n);
+  for (let i = 0; i < n; i++) order[start[typeOf[i]]++] = i;
+  return order;
 }
 
 /**

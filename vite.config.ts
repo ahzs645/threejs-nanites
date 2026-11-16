@@ -1,3 +1,5 @@
+import { execSync } from 'node:child_process';
+import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { defineConfig, type Plugin } from 'vite';
 
@@ -16,7 +18,21 @@ function ezTreeWithoutTextures(): Plugin {
   };
 }
 
+// The build's version, for what a page reports about itself (the PGMaps adapter's capture reply): the package's
+// version and this checkout's commit, `-dirty` with uncommitted changes to tracked files, read when the server starts or
+// the build runs.
+const git = (args: string): string => {
+  try {
+    return execSync(`git ${args}`, { cwd: fileURLToPath(new URL('.', import.meta.url)), stdio: ['ignore', 'pipe', 'ignore'] }).toString().trim();
+  } catch {
+    return '';
+  }
+};
+const commit = git('rev-parse --short HEAD');
+const version = `${(JSON.parse(readFileSync(new URL('./package.json', import.meta.url), 'utf8')) as { version: string }).version}${commit ? `+${commit}${git('status --porcelain --untracked-files=no') ? '-dirty' : ''}` : ''}`;
+
 export default defineConfig({
+  define: { __NANITE_VERSION__: JSON.stringify(version) },
   base: './', // relative asset paths so dist/ works under the GitHub Pages subpath
   plugins: [ezTreeWithoutTextures()],
   resolve: {
@@ -33,7 +49,7 @@ export default defineConfig({
   build: {
     target: 'es2022',
     // the demo, and the library's example (examples/gltf.html: a glTF scene through src/nanite-lib/ alone)
-    rolldownOptions: { input: { main: fileURLToPath(new URL('./index.html', import.meta.url)), gltf: fileURLToPath(new URL('./examples/gltf.html', import.meta.url)) } },
+    rolldownOptions: { input: { main: fileURLToPath(new URL('./index.html', import.meta.url)), gltf: fileURLToPath(new URL('./examples/gltf.html', import.meta.url)), pgmaps: fileURLToPath(new URL('./examples/pgmaps-scene.html', import.meta.url)) } },
   },
   // (the harness's scratch and output: browser profiles left by hung runs are ~100k files, and watching them held
   // up the dev server's first requests for minutes)

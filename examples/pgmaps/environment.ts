@@ -1,18 +1,20 @@
 // The sky, fog, sun and shadow map, set by the parent's environment (package.ts): the sun placed from the date and
 // place (below the horizon: a dim dusk, never black), its light held 6 degrees up under `sun: 'daylight'` (the
 // default) or from the real sun under `sun: 'true'` (none, and no shadows, once it has set); clear (the demo's sky,
-// sun shadows, god rays), overcast (a grey sky, no hard shadows, flat light) or rain / snow (overcast, nearer fog and falling particles, particles.ts). The
-// fog takes the sky's own colour in the view direction, as the demo's (src/lighting.ts), so far ground melts into the
-// sky rather than meeting it at a band. Changing the environment never rebuilds the drawing: only uniforms, the
+// sun shadows, god rays), overcast (a grey sky, no hard shadows, flat light) or rain / snow (overcast, nearer fog and falling particles, particles.ts).
+// The parent's `cloudCover` is the share of the clear sky drawn under cloud (sky-cover.ts finds the SkyMesh coverage
+// that draws it; 0 none), and its `visibilityKm` the haze: Koschmieder's law, every surface blended towards the
+// horizon sky's colour in its direction by 1 − exp(−σ d), σ = 3.912 / visibility; 1000 km or more, no haze at all. Changing the environment never rebuilds the drawing: only uniforms, the
 // lights and a new sky capture.
 import * as THREE from 'three/webgpu';
 import {
-  Fn, float, max, abs, mix, positionWorld, cameraPosition, cubeTexture, fog, rangeFogFactor, smoothstep, uniform,
-  vec3, vec4, positionLocal,
+  Fn, float, max, abs, mix, positionWorld, cameraPosition, cubeTexture, fog, smoothstep, uniform,
+  vec3, vec4, positionLocal, exp, length, dot, min,
 } from 'three/tsl';
 import { SkyMesh } from 'three/addons/objects/SkyMesh.js';
 import { PHASE2_LAYER, type Float, type Vec3 } from '../../src/nanite-lib/index.ts';
 import { sunFor, type Environment, type ScenePackage } from './package.ts';
+import { cloudParamsForShare, extinctionPerMeter, skyCloudShare } from './sky-cover.ts';
 
 const SKY_SCALE = 18000;
 
@@ -24,18 +26,33 @@ const SHADOW_SIZE = Number(params.get('smap') ?? 4096), SHADOW_HALF = Number(par
 /** Over this the stands' shadow can reach above the ground (m: the tallest stems, ~35 m, and some relief). */
 const RISE = 60;
 
-interface Look { sky: 'clear' | 'grey'; grey: THREE.Color; sun: number; hemi: number; shadows: boolean; fog: [number, number]; exposure: number; rays: boolean }
+/** `visibilityKm`: the weather's own haze when the parent sends none. */
+interface Look { sky: 'clear' | 'grey'; grey: THREE.Color; sun: number; hemi: number; shadows: boolean; visibilityKm: number; exposure: number; rays: boolean }
 const WEATHER: Record<Environment['weather'], Look> = {
-  clear: { sky: 'clear', grey: new THREE.Color(0.62, 0.66, 0.7), sun: 3.2, hemi: 1.3, shadows: true, fog: [900, 14000], exposure: 0.9, rays: true },
-  overcast: { sky: 'grey', grey: new THREE.Color(0.58, 0.61, 0.64), sun: 0.35, hemi: 2.5, shadows: false, fog: [400, 7000], exposure: 1.0, rays: false },
-  rain: { sky: 'grey', grey: new THREE.Color(0.42, 0.45, 0.48), sun: 0.2, hemi: 2.3, shadows: false, fog: [150, 2600], exposure: 1.05, rays: false },
-  snow: { sky: 'grey', grey: new THREE.Color(0.7, 0.72, 0.75), sun: 0.25, hemi: 2.6, shadows: false, fog: [60, 1300], exposure: 1.0, rays: false },
+  clear: { sky: 'clear', grey: new THREE.Color(0.62, 0.66, 0.7), sun: 3.2, hemi: 1.3, shadows: true, visibilityKm: 50, exposure: 0.9, rays: true },
+  overcast: { sky: 'grey', grey: new THREE.Color(0.58, 0.61, 0.64), sun: 0.35, hemi: 2.5, shadows: false, visibilityKm: 25, exposure: 1.0, rays: false },
+  rain: { sky: 'grey', grey: new THREE.Color(0.42, 0.45, 0.48), sun: 0.2, hemi: 2.3, shadows: false, visibilityKm: 8, exposure: 1.05, rays: false },
+  snow: { sky: 'grey', grey: new THREE.Color(0.7, 0.72, 0.75), sun: 0.25, hemi: 2.6, shadows: false, visibilityKm: 3, exposure: 1.0, rays: false },
 };
+/** The clear sky's cloud with no `cloudCover` from the parent: SkyMesh's coverage as the adapter always drew it. */
+const DEFAULT_COVERAGE = 0.18;
+/** A visibility at or past this (km) is no haze at all (PGMaps' `NO_HAZE_KM`). */
+export const NO_HAZE_KM = 1000;
+/** At or over this share the clear sky is drawn as the overcast dome (SkyMesh's cloud never closes completely). */
+const DOME_SHARE = 0.97;
 
-export function createEnvironment(scene: THREE.Scene, heightAt: (x: number, z: number) => number) {
+/** The sky as applied: the parent's cloud share and visibility, and SkyMesh's settings that draw them. */
+export interface SkyReport { cloudCover: number; visibilityKm: number; skyCoverage: number; skyDensity: number; dome: boolean; haze: boolean }
+
+/**
+ * `reach`: how far from the origin real ground lies (m; a capture's skyline grid, up to ~85 km at its corners). The sky
+ * is a sphere round the origin drawn after the ground, so it must lie past that or it covers the far ridges.
+ */
+export function createEnvironment(scene: THREE.Scene, heightAt: (x: number, z: number) => number, reach = 0) {
+  const skyScale = Math.max(SKY_SCALE, reach);
   // the sky: the demo's (three's SkyMesh) under a clear sky, a grey dome under cloud
   const sky = new SkyMesh();
-  sky.scale.setScalar(SKY_SCALE);
+  sky.scale.setScalar(skyScale);
   sky.turbidity.value = 2.4;
   sky.rayleigh.value = 1.6;
   sky.mieCoefficient.value = 0.003;
@@ -48,7 +65,7 @@ export function createEnvironment(scene: THREE.Scene, heightAt: (x: number, z: n
   const domeMaterial = new THREE.MeshBasicNodeMaterial({ side: THREE.BackSide, depthWrite: false, fog: false });
   domeMaterial.colorNode = mix(greyHorizon, greyTop, smoothstep(-0.05, 0.6, positionLocal.normalize().y));
   const dome = new THREE.Mesh(new THREE.SphereGeometry(1, 32, 16), domeMaterial);
-  dome.scale.setScalar(SKY_SCALE * 0.98);
+  dome.scale.setScalar(skyScale * 0.98);
   dome.renderOrder = 2;
   dome.frustumCulled = false;
   scene.add(sky, dome);
@@ -63,12 +80,26 @@ export function createEnvironment(scene: THREE.Scene, heightAt: (x: number, z: n
   capture.add(sky2, dome2);
   const cube = new THREE.CubeRenderTarget(64, { type: THREE.HalfFloatType, generateMipmaps: true, minFilter: THREE.LinearMipmapLinearFilter });
   const cubeCam = new THREE.CubeCamera(1, 1000, cube);
-  const fogNear = uniform(900), fogFar = uniform(14000);
+  /** Koschmieder's extinction (per metre); 0: no haze (the class pass). */
+  const extinction = uniform(extinctionPerMeter(50));
+  /**
+   * The airlight's brightest: a white surface's radiance under the scene's sun and sky light. SkyMesh draws its sky in
+   * its own units, about a hundred times a lit forest (the picture clips it white); blended toward that, 3% of haze
+   * at 400 m turned the far shore pale. Capped here, a forest is about a twentieth of the horizon, as in daylight.
+   */
+  const airlight = uniform(1.2);
+  /** The horizon sky's colour in the direction of `pos` from the eye (its luminance capped at `airlight`). */
   const fogColour = (pos: Vec3): Vec3 => {
-    const d = pos.sub(cameraPosition).normalize();
-    return cubeTexture(cube.texture, vec3(d.x, max(d.y, 0.02), d.z).normalize()).level(float(2)).rgb;
+    const d = pos.sub(cameraPosition);
+    const c = cubeTexture(cube.texture, vec3(d.x, length(d.xz).mul(0.02).add(1e-3), d.z).normalize()).level(float(2)).rgb;
+    const lum = max(dot(c, vec3(0.2126, 0.7152, 0.0722)), 1e-4);
+    return c.mul(min(float(1), airlight.div(lum)));
   };
-  scene.fogNode = fog(fogColour(positionWorld), rangeFogFactor(fogNear, fogFar));
+  /** Where the haze starts (m): the VIA look's renders draw none to about 8 km, a photo's from the eye. */
+  const hazeStart = uniform(0);
+  /** The share of the way to the horizon sky a surface at `pos` is drawn: 1 − exp(−σ max(0, d − start)). */
+  const fogFactor = (pos: Vec3): Float => float(1).sub(exp(extinction.negate().mul(max(length(pos.sub(cameraPosition)).sub(hazeStart), 0))));
+  scene.fogNode = fog(fogColour(positionWorld), fogFactor(positionWorld));
 
   // lights: sky and ground bounce, and the sun with the shadow map (its casters, the stand's shadow meshes, on layer 1)
   const hemi = new THREE.HemisphereLight(0xbcd3ec, 0x4a4632, 1.3);
@@ -97,6 +128,8 @@ export function createEnvironment(scene: THREE.Scene, heightAt: (x: number, z: n
   });
 
   let SH = 0, SV = 0;
+  /** The shadow map's half-extent in front of the eye (m): a final capture widens it over the frame's near stand. */
+  let shadowHalf = SHADOW_HALF;
   const back = () => SH * 2.5 + 400;
   function setExtent(h: number, rise: number): void {
     const sinE = Math.max(0.1, lightDir.y), cosE = Math.sqrt(1 - sinE * sinE);
@@ -112,11 +145,11 @@ export function createEnvironment(scene: THREE.Scene, heightAt: (x: number, z: n
     const fwd = camera.getWorldDirection(new THREE.Vector3()).setY(0);
     if (fwd.lengthSq() < 1e-6) fwd.set(0, 0, -1);
     fwd.normalize();
-    const focus = camera.position.clone().addScaledVector(fwd, SHADOW_HALF * 0.6);
+    const focus = camera.position.clone().addScaledVector(fwd, shadowHalf * 0.6);
     focus.y = heightAt(focus.x, focus.z);
     let relief = 0;
-    for (let i = -2; i <= 2; i++) for (let j = -2; j <= 2; j++) relief = Math.max(relief, Math.abs(heightAt(focus.x + (i * SHADOW_HALF) / 2, focus.z + (j * SHADOW_HALF) / 2) - focus.y));
-    setExtent(SHADOW_HALF, Math.ceil((relief + RISE) / 10) * 10);
+    for (let i = -2; i <= 2; i++) for (let j = -2; j <= 2; j++) relief = Math.max(relief, Math.abs(heightAt(focus.x + (i * shadowHalf) / 2, focus.z + (j * shadowHalf) / 2) - focus.y));
+    setExtent(shadowHalf, Math.ceil((relief + RISE) / 10) * 10);
     const sinE = Math.max(0.1, lightDir.y);
     const texel = Math.max(2 * SH, (2 * SV) / sinE) / SHADOW_SIZE;
     sun.shadow.normalBias = texel;
@@ -136,6 +169,7 @@ export function createEnvironment(scene: THREE.Scene, heightAt: (x: number, z: n
   }
 
   let recapture = true, exposure = 0.9;
+  let skyReport: SkyReport = { cloudCover: DEFAULT_COVERAGE, visibilityKm: 50, skyCoverage: DEFAULT_COVERAGE, skyDensity: 0.4, dome: false, haze: true };
   /** Sets the environment (any time: before the first frame or between frames). */
   function apply(env: Environment, origin: ScenePackage['origin']): SunReport {
     const pos = sunFor(env, origin);
@@ -172,8 +206,26 @@ export function createEnvironment(scene: THREE.Scene, heightAt: (x: number, z: n
       greyHorizon.value.copy(look.grey).multiplyScalar(0.35 + 0.65 * day);
       greyTop.value.copy(look.grey).multiplyScalar((0.35 + 0.65 * day) * 0.82);
     }
-    fogNear.value = look.fog[0];
-    fogFar.value = look.fog[1];
+    // the cloud: the parent's share of the clear sky (none: as always drawn), the overcast dome under full cloud
+    const share = look.sky === 'clear' ? env.cloudCover : 1;
+    const overcastDome = look.sky === 'grey' || (share !== undefined && share >= DOME_SHARE);
+    const cloud = share === undefined ? { coverage: DEFAULT_COVERAGE, density: 0.4 } : overcastDome ? { coverage: 0, density: 0.4 } : cloudParamsForShare(share);
+    for (const s of [sky, sky2]) {
+      s.cloudCoverage.value = cloud.coverage;
+      s.cloudDensity.value = cloud.density;
+    }
+    if (overcastDome && look.sky === 'clear' && !twilight) {
+      sky.visible = sky2.visible = false;
+      dome.visible = dome2.visible = true;
+      greyHorizon.value.copy(WEATHER.overcast.grey).multiplyScalar(0.35 + 0.65 * day);
+      greyTop.value.copy(WEATHER.overcast.grey).multiplyScalar((0.35 + 0.65 * day) * 0.82);
+    }
+    // (a photo's distance is blue-grey, not the sky's white: the airlight held lower)
+    airlight.value = Math.max(0.03, (sun.intensity * Math.max(0, lightDir.y) + hemi.intensity) / Math.PI) * (env.look === 'photo' ? 0.55 : 1);
+    hazeStart.value = env.look === 'photo' ? 0 : 8000;
+    const visibilityKm = env.visibilityKm ?? look.visibilityKm;
+    extinction.value = visibilityKm >= NO_HAZE_KM ? 0 : extinctionPerMeter(visibilityKm); // (PGMaps' "No haze")
+    skyReport = { cloudCover: +(share ?? skyCloudShare(DEFAULT_COVERAGE)).toFixed(3), visibilityKm, skyCoverage: +cloud.coverage.toFixed(3), skyDensity: +cloud.density.toFixed(3), dome: overcastDome, haze: visibilityKm < NO_HAZE_KM };
     snow.value = env.ground === 'snow' ? 1 : 0;
     // (dusk: the eye adapts, never black; snow on the ground: the camera stops down, or the snow is a white sheet)
     exposure = look.exposure * (1 + 0.9 * (1 - day)) * (env.ground === 'snow' ? 0.72 : 1);
@@ -201,5 +253,10 @@ export function createEnvironment(scene: THREE.Scene, heightAt: (x: number, z: n
   /** The god rays want the sun on screen under a clear sky. */
   const raysOn = (): boolean => look.rays && castShadows;
 
-  return { sky, sun, hemi, sunDir, lightDir, fogNear, fogFar, fogColour, fadeShadow, snow, wet, apply, frame, raysOn };
+  /** Sets the shadow map's half-extent (m; null: the live view's). */
+  const setShadowHalf = (h: number | null): void => {
+    shadowHalf = h ?? SHADOW_HALF;
+  };
+
+  return { setShadowHalf, skyScale, sky, sun, hemi, sunDir, lightDir, extinction, fogColour, fogFactor, fadeShadow, snow, wet, apply, frame, raysOn, skyReport: (): SkyReport => skyReport };
 }

@@ -38,6 +38,12 @@ export const SPECIES: Record<string, SpeciesLook> = {
   aspen: { preset: 'Aspen Large', conifer: false, bark: 'birch', leaf: 'aspen', barkTint: [0.9, 0.95, 0.86], leafTint: [0.4, 0.74, 0.82], options: { leaves: { count: 22 } }, seed: 505 },
   // paper birch: white bark, small leaves (the ash image)
   birch: { preset: 'Aspen Large', conifer: false, bark: 'birch', leaf: 'ash', barkTint: [1, 1, 1], leafTint: [0.9, 0.9, 0.86], options: { branch: { angle: { 1: 38 } }, leaves: { count: 24, size: 2.6 } }, seed: 606 },
+  // a snag on burnt ground (burnt.ts: the adapter's own species, never PGMaps'): a fire-killed conifer, no needles, its
+  // branches charred stubs out from a grey-black trunk (the Gun Lake renders' bare grey-black spikes)
+  snag: {
+    preset: 'Pine Large', conifer: true, bark: 'pine', leaf: 'pine', barkTint: [0.36, 0.33, 0.37], leafTint: [0.3, 0.3, 0.3],
+    options: { branch: { angle: { 1: 96 }, children: { 0: 70 }, gnarliness: { 0: 0.06, 1: 0.25 } }, leaves: { count: 0 } }, seed: 707,
+  },
 };
 /** A species the adapter has no look for draws as this one. */
 export const FALLBACK_SPECIES = 'spruce';

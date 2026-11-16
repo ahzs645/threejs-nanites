@@ -13,7 +13,7 @@ import type { NaniteRenderer } from './renderer.ts';
 import type { Bool, Float, Uint, Vec3 } from '../types.ts';
 import type { ClusterVertex, CullSet, View } from './types.ts';
 import { setEmissive } from '../three-gaps.ts';
-import { makeLeafAlpha, a2cDither, dither, typeId, switchPx, mipBias, unfold, FOLD_FIX } from './shading.ts';
+import { makeLeafAlpha, typeId, switchPx, mipBias, unfold, FOLD_FIX, CLASS_DEBUG, flatDebug, fadeKept, leafAlphaDrawn } from './shading.ts';
 
 /**
  * The leaf draws' index buffer, shared by every leaf cluster: a cluster's cards are quads from its first vertex
@@ -72,7 +72,8 @@ export const drawMethods = {
 
   /**
    * Debug colours: 1 = cluster, 2 = DAG level, 3 = tree instance, 4 = tree type (unlit, see TYPE_IDS),
-   * 5 = rasterizer (hardware grey-green; the software rasterizer's pixels are orange, see softraster.js).
+   * 5 = rasterizer (hardware grey-green; the software rasterizer's pixels are orange, see softraster.js), 7 = the class
+   * pass (the tree's class colour, unlit: shading.ts CLASS_DEBUG, setInstanceClasses).
    */
   _debugColour(this: NaniteRenderer, inst: Uint, c: Uint, type: Uint): Vec3 {
     const u = this.u;
@@ -80,7 +81,7 @@ export const drawMethods = {
     const dbgSeed = select(u.debug.equal(1), c, select(u.debug.equal(2), level.mul(7919).add(3), inst));
     const palette = vec3(hash(dbgSeed), hash(dbgSeed.add(17)), hash(dbgSeed.add(43)));
     const levelRamp = mix(vec3(0.1, 0.9, 0.2), vec3(1.0, 0.15, 0.1), clamp(float(level).div(8), 0, 1));
-    return select(u.debug.equal(5), vec3(0.25, 0.4, 0.25), select(u.debug.equal(4), typeId(type), select(u.debug.equal(2), levelRamp, palette)));
+    return select(u.debug.equal(CLASS_DEBUG), this._classColour(inst), select(u.debug.equal(5), vec3(0.25, 0.4, 0.25), select(u.debug.equal(4), typeId(type), select(u.debug.equal(2), levelRamp, palette))));
   },
 
   /** `afterPrepass`: the leaves drawn after their depth prepass (prepass.ts), which writes their depth. */
@@ -170,8 +171,8 @@ export const drawMethods = {
     } else if (kind === 0) {
       mat = new THREE.MeshStandardNodeMaterial({ roughness: 0.92, metalness: 0, alphaTest: 0.5 });
       const col = this.look.solidColour(texture(textures.bark, vUv).depth(layerI).bias(mipBias).rgb, vTint, vAutumn);
-      mat.colorNode = vec4(select(u.debug.equal(4), vec3(0), select(u.debug.greaterThan(0), vDebug, col)), select(dither().lessThan(vFade), float(1), float(0)));
-      mat.emissiveNode = select(u.debug.equal(4), vDebug, vec3(0));
+      mat.colorNode = vec4(select(flatDebug(u), vec3(0), select(u.debug.greaterThan(0), vDebug, col)), select(fadeKept(u, vFade), float(1), float(0)));
+      mat.emissiveNode = select(flatDebug(u), vDebug, vec3(0));
       if (unfolds) mat.normalNode = select(unfolds, unfold(normalView, normalFlat, positionView.negate()), normalView); // (folds of a scan: shading.ts)
     } else {
       // Lambert: no specular sheen on leaves, and cheaper for the heavy foliage overdraw
@@ -185,19 +186,20 @@ export const drawMethods = {
         const layer = layerI.toVar();
         const tex = texture(textures.leaf, vUv).depth(layer).bias(mipBias).toVar();
         // (without MSAA, under TAA: alpha to coverage against a moving dither, see a2cDither)
-        const alpha = textures.leafDither ? a2cDither(leafAlpha(tex.a, layer)) : leafAlpha(tex.a, layer);
-        alphaV.assign(select(dither().lessThan(vFade), alpha, float(0)));
+        // (the class pass: cut at 0.5, no dither)
+        const alpha = leafAlphaDrawn(u, leafAlpha(tex.a, layer), textures.leafDither);
+        alphaV.assign(select(fadeKept(u, vFade), alpha, float(0)));
         colV.assign(vec3(0));
         If(alphaV.greaterThan(0), () => {
           colV.assign(this.look.cardColour(tex.rgb, layer, vTint, vAutumn));
         });
-        return vec4(select(u.debug.equal(4), vec3(0), select(u.debug.greaterThan(0), vDebug, colV)), alphaV);
+        return vec4(select(flatDebug(u), vec3(0), select(u.debug.greaterThan(0), vDebug, colV)), alphaV);
       })();
       mat.receivedShadowPositionNode = select(alphaV.greaterThan(0), positionWorld, vec3(1e7));
       // keep the outward crown normal on both faces (default flips it on back faces => black leaves)
       mat.normalNode = normalViewGeometry;
       // light passing through leaves
-      setEmissive(mat, select(u.debug.equal(4), vDebug, select(u.debug.greaterThan(0), vec3(0), colV.mul(0.12))));
+      setEmissive(mat, select(flatDebug(u), vDebug, select(u.debug.greaterThan(0), vec3(0), colV.mul(0.12))));
     }
     mat.positionNode = position;
     if (afterPrepass) mat.depthWrite = false;

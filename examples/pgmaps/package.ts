@@ -2,6 +2,7 @@
 // parent's environment message: the date, place, ground and weather, with the sun placed from them.
 //
 // The package is local metres: x east, y north, z up (heights absolute). In three, y is up and north is -z.
+import type { CameraProjection } from './camera.ts';
 
 export type Ring = Array<[number, number]>;
 
@@ -14,24 +15,69 @@ export interface SpeciesInfo {
   broadleaf?: boolean;
 }
 
+/** A grid of heights: its south-west post (package metres), spacing, size, row-major from the south row, west to east. */
+export interface TerrainGrid {
+  west: number; south: number; spacing: number; columns: number; rows: number; heights: Array<number | null>;
+  /**
+   * Crown closure at each post, 0..1, the same layout as `heights`: the share of the ground under tree crowns (VRI
+   * crown closure, else PGMaps' regional stand), 0 on cut, non-treed and water ground, null unknown. Absent from
+   * older packages (the adapter then reads the stems' crowns).
+   */
+  canopy?: Array<number | null>;
+  /**
+   * Natural ground cover at each post, the same layout (PGMaps' `SCENE_COVER`, ground-cover.ts COVER): 0 forest,
+   * 1 sparse forest, 2 shrub, 3 herb/grass, 4 rock or exposed soil, 5 water, 6 cut ground, 7 burnt (a recent wildfire:
+   * its stems drawn as snags, burnt.ts); null unknown. Absent from older packages (the ground then drawn as before).
+   */
+  cover?: Array<number | null>;
+  /**
+   * The fire season at each burnt post (cover 7), the same layout (PGMaps' `coverOnGrid` `burntYear`: the latest
+   * recent BC Wildfire Service perimeter holding the post); null elsewhere or unknown (drawn DEFAULT_BURN_AGE years
+   * after the fire). Absent: every burn of unknown year. `fireYear` is read the same where `burntYear` is absent.
+   */
+  burntYear?: Array<number | null>;
+  fireYear?: Array<number | null>;
+}
+
+/** Cleared ground: rings in local metres (outer ring first, then holes). */
+export interface Opening {
+  kind?: string;
+  rings: Ring[];
+  /** Years from harvest to the view's date (0: just cut); null or absent: unknown (drawn as about a year). */
+  ageYears?: number | null;
+  /** The share of the stand left standing in it as dispersed trees, 0..1 (those stems are in `trees`). */
+  retainedShare?: number | null;
+}
+
 export interface ScenePackage {
   format: 'pgmaps-forest-scene';
   version: 1;
+  /** When PGMaps wrote it (ISO). */
+  createdAt?: string;
   origin?: { lng: number; lat: number; elevationMeters: number };
-  terrain: { west: number; south: number; spacing: number; columns: number; rows: number; heights: Array<number | null> };
+  terrain: TerrainGrid;
+  /** Coarser ground past `terrain` (a capture's package, to about 15 km), the same layout; null posts unknown. */
+  farTerrain?: TerrainGrid;
+  /**
+   * The coarsest ground past `farTerrain`, out to the frames' real skyline (a capture's package), the same layout.
+   * Its heights are already lowered for the earth's curvature and refraction (`earthCurvature`): drawn as given, and
+   * only where neither grid inside it has posts.
+   */
+  skylineTerrain?: TerrainGrid & { earthCurvature?: { earthRadiusMeters: number; refraction: number } };
   /** fields: x, y, z, species (index into `species`), height, crownWidth, tone (0..1). */
   trees: { fields: string[]; species: string[]; count: number; data: number[] };
   species?: Record<string, SpeciesInfo>;
   models?: Record<string, { positions: number[]; normals: number[]; bark: number[] }>;
-  /** Cut blocks and other cleared ground: rings in local metres (outer ring first, then holes). */
-  openings?: Array<{ kind?: string; rings: Ring[] }>;
+  /** Cut blocks and other cleared ground. */
+  openings?: Opening[];
   /** Slash piles and logs: fields x, y, z, footprint (m across). */
   debris?: { fields: string[]; count: number; data: number[] };
   /** Road cut and fill slopes: exposed soil and rock. */
   roadScars?: Array<{ kind: 'cut' | 'fill'; ring: Ring }>;
   /** Lakes and ponds (optional): outer ring then holes; the surface's elevation, or null for the lowest ground on the shore. */
   water?: Array<{ rings: Ring[]; elevationMeters: number | null }>;
-  camera: { position: [number, number, number]; bearingDegrees: number; pitchDegrees: number; verticalFovDegrees: number };
+  camera: { position: [number, number, number]; bearingDegrees: number; pitchDegrees: number; verticalFovDegrees: number; projection?: CameraProjection };
+  environment?: Environment;
   treeRadiusMeters?: number;
 }
 
@@ -55,7 +101,20 @@ export interface Environment {
   sunPosition?: { elevationDegrees: number; azimuthDegrees: number };
   ground: Ground;
   weather: Weather;
+  /** Share of the sky under cloud, 0..1 (1 under overcast, rain or snow); absent: the weather's own. */
+  cloudCover?: number;
+  /** Meteorological visibility (km): the haze over distance by Koschmieder's law; absent: the weather's own. */
+  visibilityKm?: number;
+  /** Wind over water (m/s): 0 a mirror, a few m/s a ripple (Cox–Munk roughness, water.ts); absent: calm. */
+  windMs?: number;
+  /**
+   * `via`: the consultants' renders (dark olive canopy, crisp mirror lakes, haze only past 8–10 km); `photo`: a
+   * photograph's (blue-grey far forest, the haze from `visibilityKm`, wind-rippled water reflecting the sky). Absent: via.
+   */
+  look?: EngineLook;
 }
+
+export type EngineLook = 'via' | 'photo';
 
 /** No message: a clear summer midday, as the adapter always drew (the sun high in the south-south-west). */
 export const DEFAULT_ENVIRONMENT: Environment = { ground: 'bare', weather: 'clear' };
@@ -76,7 +135,13 @@ export function parseEnvironment(data: Record<string, unknown> | null | undefine
   const given = data.sunPosition as Record<string, unknown> | undefined;
   const elevationDegrees = num(given?.elevationDegrees), azimuthDegrees = num(given?.azimuthDegrees);
   const sunPosition = elevationDegrees !== undefined && azimuthDegrees !== undefined ? { elevationDegrees, azimuthDegrees } : undefined;
-  return { dateTime, timeZone, utc, sun, latitude: num(data.latitude), longitude: num(data.longitude), sunPosition, ground, weather };
+  const cover = num(data.cloudCover), visibility = num(data.visibilityKm);
+  const cloudCover = cover === undefined ? undefined : Math.min(1, Math.max(0, cover));
+  const visibilityKm = visibility !== undefined && visibility > 0 ? visibility : undefined;
+  const wind = num(data.windMs);
+  const windMs = wind === undefined ? undefined : Math.min(20, Math.max(0, wind));
+  const look: EngineLook | undefined = data.look === 'photo' ? 'photo' : data.look === 'via' ? 'via' : undefined;
+  return { dateTime, timeZone, utc, sun, latitude: num(data.latitude), longitude: num(data.longitude), sunPosition, ground, weather, cloudCover, visibilityKm, windMs, look };
 }
 
 function validZone(zone: string): boolean {
@@ -120,7 +185,7 @@ export function environmentFromUrl(params: URLSearchParams): Environment | null 
       return null;
     }
   }
-  const keys = ['dateTime', 'utc', 'timeZone', 'sun', 'latitude', 'longitude', 'ground', 'weather'];
+  const keys = ['dateTime', 'utc', 'timeZone', 'sun', 'latitude', 'longitude', 'ground', 'weather', 'cloudCover', 'visibilityKm', 'windMs', 'look'];
   if (!keys.some((k) => params.has(k))) return null;
   return parseEnvironment(Object.fromEntries(keys.map((k) => [k, params.get(k) ?? undefined])));
 }

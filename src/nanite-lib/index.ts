@@ -35,9 +35,9 @@ export {
 } from './gpu/constants.ts';
 export {
   makeLeafAlpha, makeLeafAlphaLod, a2cDither, dither, ditherAt, ditherAlt, ditherShift, mipBias, footprint, switchPx, typeId,
-  TYPE_IDS, LEAF_DITHER, LEAF_COV,
+  TYPE_IDS, LEAF_DITHER, LEAF_COV, CLASS_DEBUG, flatDebug, fadeKept, leafAlphaDrawn,
 } from './gpu/shading.ts';
-export { GROW, GROW_SHADOW, IMP_DITHER, IMP_COV, DROP, DROP_FADE, type ImpostorGains } from './gpu/billboards.ts';
+export { GROW, GROW_SHADOW, IMP_DITHER, IMP_COV, DROP, DROP_FADE, impExact, type ImpostorGains } from './gpu/billboards.ts';
 export { MAX_PIXELS } from './gpu/softraster.ts';
 
 // impostors: the atlas (albedo + normals from 4 elevations), its bake and coverage

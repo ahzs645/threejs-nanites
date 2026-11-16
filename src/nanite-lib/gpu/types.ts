@@ -19,6 +19,8 @@ export interface NaniteUniforms {
   time: U<'float', number>;
   prevTime: U<'float', number>;
   debug: U<'uint', number>;
+  /** Debug 7's (the class pass's) flat tree colour, linear 0..1 (shading.ts CLASS_DEBUG). */
+  classColour: U<'vec3', THREE.Vector3>;
   occlusion: U<'uint', number>;
   sunDir: U<'vec3', THREE.Vector3>;
   castLen: U<'float', number>;

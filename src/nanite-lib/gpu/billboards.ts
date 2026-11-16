@@ -8,7 +8,7 @@ import {
 } from 'three/tsl';
 import { IMPOSTOR_CUT, ELEVATIONS, TILE_W, TILE_H, atlasLayout } from '../impostors/atlas.ts';
 import { MIN_PX, FADE_HI, PHASE2_LAYER, IMP_ARGS } from './constants.ts';
-import { dither, ditherAlt, typeId, switchPx, mipBias } from './shading.ts';
+import { ditherAlt, typeId, switchPx, mipBias, CLASS_DEBUG, fadeKept } from './shading.ts';
 import type { StorageBufferNode, UniformArrayNode, TextureNode } from 'three/webgpu';
 import type { NaniteRenderer } from './renderer.ts';
 import type { View } from './types.ts';
@@ -25,6 +25,8 @@ interface ImpostorQuad {
   vMirror: Float;
   vDir: Vec3;
   vShadowPos: Vec3;
+  /** The tree's class-pass colour (debug 7; setInstanceClasses), flat. */
+  vClass: Vec3;
   position: Vec3;
   /** Its two tiles' uv in the atlas and elevation (degrees). New nodes each time, not a shared one: first built in a branch, a
    * shared one is set there only (as with the mirroring below). */
@@ -69,7 +71,8 @@ export const DROP_FADE = 0.2;
  */
 export const impostorShare = (inst: Uint, cov: Float, wPx: Float): { k: Float; cov: Float } => {
   if (!(DROP[0] > 0)) return { k: float(1), cov };
-  const p = mix(float(1), min(cov, 1), smoothstep(DROP[0], DROP[1], wPx)).toVar(); // (the share kept)
+  // (impExact: every tree kept, p = 1 gives k = 1 and the type's own coverage scale)
+  const p = mix(float(1), min(cov, 1), smoothstep(DROP[0], DROP[1], wPx).mul(impExact.oneMinus())).toVar(); // (the share kept)
   const h = hash(inst.add(23)).mul(1 - DROP_FADE).add(DROP_FADE / 2);
   const k = clamp(p.sub(h).div(DROP_FADE).add(0.5), 0, 1).toVar();
   return { k, cov: cov.div(p).mul(k) };
@@ -83,6 +86,12 @@ const KEEP_AREA = new URLSearchParams(location.search).get('impkeep') !== 'width
  * at a quarter resolution, 0.79 at half), so fewer, bigger quads pay where lower resolution stopped paying.
  */
 export const impMinPx = uniform(Number(new URLSearchParams(location.search).get('impmin') ?? MIN_PX));
+/**
+ * 1: every impostor drawn at its own size, however small: no share of far trees dropped (DROP) and no sub-MIN_PX
+ * thinning (the application sets impMinPx near 0 with it). An application's still capture, where each stem must be
+ * drawn and shimmer does not matter (TAA averages a held camera's sub-pixel quads); 0, the default, as drawn live.
+ */
+export const impExact = uniform(0);
 export const keepShare = (wPx: Float): Float => (KEEP_AREA ? wPx.div(impMinPx).pow(2) : wPx.div(impMinPx));
 export const deg = Math.PI / 180;
 // the elevation tiles are evenly spaced from 0 (each blends with the next round the midpoint between them, +-7.5
@@ -163,6 +172,7 @@ export const billboardMethods = {
     // where the quad's pixels look up the shadow map: moved towards the sun past the tree's own sun-facing caster
     // quad (its self-shadow is the average treeshade instead, see lighting.js and main.js); the neighbours' shadows remain
     const vShadowPos = varying(vec3(0), 'vImpShadowPos');
+    const vClass = varying(vec3(0), 'vImpClass').setInterpolation('flat');
     const position = Fn(() => {
       const inst = list.element(instanceIndex).toVar(); // (one instance per listed impostor, see View.impListAttr)
       const on = bool(true).toVar();
@@ -220,6 +230,7 @@ export const billboardMethods = {
       if (screen) {
         const seed = hash(inst.add(31)).mul(4096).floor().add(1);
         vFacing.assign(vec4(dir, select(flip, seed.negate(), seed)));
+        If(u.debug.equal(CLASS_DEBUG), () => vClass.assign(this._classColour(inst))); // (the class pass only)
         vShadowPos.assign(this.look.curve(p.add(u.sunDir.mul(w.add(h).mul(0.5)))));
         normalLocal.assign(dir);
       }
@@ -265,7 +276,7 @@ export const billboardMethods = {
       return hash(cell.x.add(cell.y.mul(4099)).add(uint(vFacing.w.abs().sub(1)).mul(1048573))).lessThan(cov);
     };
     return {
-      vCov: vTree.x, vAutumn: vTree.y, vTint: vTree.z, vFade: vTree.w, vMirror: vFacing.w.sign(), vDir: vFacing.xyz, vShadowPos,
+      vCov: vTree.x, vAutumn: vTree.y, vTint: vTree.z, vFade: vTree.w, vMirror: vFacing.w.sign(), vDir: vFacing.xyz, vShadowPos, vClass,
       position, uvOf, elevOf, wts, lod, sample, tile, cutAlpha, plainAlpha, holes,
     };
   },
@@ -314,8 +325,10 @@ export const billboardMethods = {
       const plain = q.plainAlpha(t);
       const a = q.cutAlpha(t, lodV).map((ak) => ak.toVar());
       weight = a;
-      const shown = impDither ? select(min(max(plain[0], plain[1]), 1).mul(mix(float(IMP_COV), float(1), this.solidOf.element(tile))).greaterThan(ditherAlt(screenCoordinate.xy)), float(1), float(0)) : min(max(a[0], a[1]), 1);
-      alphaV.assign(select(q.holes(q.vCov, lodV).and(dither().greaterThanEqual(vFade)), shown, float(0)));
+      const drawn = impDither ? select(min(max(plain[0], plain[1]), 1).mul(mix(float(IMP_COV), float(1), this.solidOf.element(tile))).greaterThan(ditherAlt(screenCoordinate.xy)), float(1), float(0)) : min(max(a[0], a[1]), 1);
+      // (the class pass, debug 7: the cut-out, no dither; the cross-fade split at 0.5, the geometry's other half)
+      const shown = select(u.debug.equal(CLASS_DEBUG), select(min(max(a[0], a[1]), 1).greaterThanEqual(IMPOSTOR_CUT), float(1), float(0)), drawn);
+      alphaV.assign(select(q.holes(q.vCov, lodV).and(fadeKept(u, vFade).not()), shown, float(0)));
       colV.assign(vec3(0)); // (here: first built in a branch, three.js sets it to its first value again in the next branch that reads it)
       If(alphaV.greaterThan(0), () => {
         const wSum = max(a[0].add(a[1]), 1e-4);
@@ -326,7 +339,7 @@ export const billboardMethods = {
       });
       return vec4(select(u.debug.greaterThan(0), vec3(0), colV), alphaV);
     })();
-    setEmissive(mat, select(u.debug.equal(4), typeId(tile), select(u.debug.greaterThan(0), vec3(0.9, 0.2, 0.8), colV.mul(0.12))));
+    setEmissive(mat, select(u.debug.equal(CLASS_DEBUG), q.vClass, select(u.debug.equal(4), typeId(tile), select(u.debug.greaterThan(0), vec3(0.9, 0.2, 0.8), colV.mul(0.12)))));
     // tree-local normals to world: tile k looks from +z tilted up by e (screen right +x, up (0, cos e, -sin e)); the billboard's
     // right (incl. mirroring) and up, as the quad's
     mat.normalNode = Fn(() => {

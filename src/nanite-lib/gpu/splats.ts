@@ -25,7 +25,7 @@ import type { ImpostorAtlas } from '../impostors/atlas.ts';
 import { GROW, ELEV_STEP, IMP_DITHER, IMP_COV, deg, keepShare, impMinPx, impostorCov, impostorShare, impostorView } from './billboards.ts';
 import { PHASE2_LAYER, SPLAT, SPLAT_BIT, WG, minU, minI, maxI } from './constants.ts';
 import { MAX_PIXELS } from './softraster.ts';
-import { ditherAlt, typeId, mipBias } from './shading.ts';
+import { ditherAlt, typeId, mipBias, CLASS_DEBUG } from './shading.ts';
 import { setEmissive, asReceivedShadow, floatBits } from '../three-gaps.ts';
 import type { NaniteRenderer } from './renderer.ts';
 import type { Bool, Float, Uint, Vec2, Vec3 } from '../types.ts';
@@ -270,7 +270,7 @@ export class Splats {
       return vec4(select(u.debug.greaterThan(0), vec3(0), col), 1);
     })();
     mat.normalNode = normalize(cameraViewMatrix.mul(vec4(nWorld.add(sh.dir.mul(1e-3)), 0)).xyz);
-    setEmissive(mat, select(u.debug.equal(5), SPLAT_DEBUG, select(u.debug.equal(4), typeId(sh.type), select(u.debug.greaterThan(0), vec3(0.9, 0.2, 0.8), col.mul(0.12)))));
+    setEmissive(mat, select(u.debug.equal(CLASS_DEBUG), f._classColour(sh.inst), select(u.debug.equal(5), SPLAT_DEBUG, select(u.debug.equal(4), typeId(sh.type), select(u.debug.greaterThan(0), vec3(0.9, 0.2, 0.8), col.mul(0.12))))));
     // (the shadow map on its sun side, past its own caster quad: see vShadowPos)
     // (off the map for the pixels it discards, see SoftRaster's)
     mat.receivedShadowPositionNode = select(id.lessThan(uint(SPLAT_BIT)), vec3(1e7), this.nanite.look.curve(onQuad.add(u.sunDir.mul(q.w.add(q.h).mul(0.5)))));
