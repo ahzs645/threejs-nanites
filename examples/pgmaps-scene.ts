@@ -366,7 +366,7 @@ async function loadScene(): Promise<ScenePackage> {
         input.hidden = true;
         resolve(scene);
       } catch {
-        info.textContent = 'Could not read that file as JSON. Choose a PGMaps scene package.';
+        host.status('Could not read that file as JSON. Choose a PGMaps scene package.');
         input.value = '';
       }
     };
