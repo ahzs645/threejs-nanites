@@ -23,6 +23,8 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc -p . && tsc -p tools && node tools/check-lib.ts && vite build",
+    "build:pgmaps": "vite build --mode pgmaps",
+    "test:pgmaps": "node --test examples/pgmaps/*.test.ts",
     "typecheck": "tsc -p . && tsc -p tools && node tools/check-lib.ts",
     "preview": "vite preview",
     "harness": "node tools/harness.ts",

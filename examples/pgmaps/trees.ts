@@ -20,6 +20,10 @@ import { dropTreeStore, openTreeStore, type TreeStore } from './tree-cache.ts';
 import lockfile from '../../package-lock.json?raw';
 
 declare const __NANITE_VERSION__: string | undefined;
+/** Where the bark and leaf images are, from the page: ../textures/ on the full site, textures/ beside a release's page
+ * (vite.config.ts, `--mode pgmaps`). */
+declare const __PGMAPS_TEXTURES__: string | undefined;
+const TEXTURES = typeof __PGMAPS_TEXTURES__ === 'string' ? __PGMAPS_TEXTURES__ : '../textures/';
 
 /** Each model is built this tall and scaled to its stem's height. */
 export const MODEL_HEIGHT = 20;
@@ -32,8 +36,8 @@ const image = (url: string, leaf: boolean): Promise<LayerData> => {
   return p;
 };
 /** A bark image's texels (the debris' logs take it too). */
-export const barkImage = (b: BarkImage) => image(`../textures/${b}_color_1k.jpg`, false);
-const leafImage = (l: LeafImage) => image(`../textures/${l}_color.png`, true);
+export const barkImage = (b: BarkImage) => image(`${TEXTURES}${b}_color_1k.jpg`, false);
+const leafImage = (l: LeafImage) => image(`${TEXTURES}${l}_color.png`, true);
 
 /** A copy of a layer with its sRGB bytes scaled (the alpha, its scales and mask kept). */
 function tinted(l: LayerData, [r, g, b]: [number, number, number]): LayerData {

@@ -335,6 +335,28 @@ drawn 250,000 times with nothing of the demo's.
 
 `AGENTS.md` is the guide to the codebase: how each part works, why it's built that way, and how to check a change.
 
+### PGMaps scene releases
+
+PGMaps embeds `examples/pgmaps-scene.html` in an iframe and talks to it by `postMessage`. `/examples/pgmaps-scene.html`
+on the site follows `main`; a release is a fixed build PGMaps can pin. To cut one, from a commit on `main`:
+
+```sh
+git tag pgmaps-scene-v1.1.0 && git push origin pgmaps-scene-v1.1.0
+```
+
+`.github/workflows/pgmaps-release.yml` then runs the typecheck and `npm run test:pgmaps`, builds the page alone
+(`npm run build:pgmaps`, into `dist-pgmaps/`), attaches it to a GitHub Release as `pgmaps-scene-1.1.0.zip` and starts
+`deploy-pages.yml`, which unpacks every `pgmaps-scene-v*` release onto the site (a browser cannot load a Release asset:
+GitHub sends no CORS headers). Each version is served at
+
+```
+https://projects.ahmadjalil.com/threejs-nanites/pgmaps/<version>/pgmaps-scene.html?embed
+```
+
+and `pgmaps/versions.json` lists them (version, tag, commit, dates). A release's page reports its version as
+`pgmaps-scene <version>+<commit>` in its capture reply; other builds report the package version and commit. To try a
+release build locally: `PGMAPS_SCENE_VERSION=1.1.0 npm run build:pgmaps`, then serve `dist-pgmaps/` from any subpath.
+
 ### Headless harness
 
 `npm run harness` boots Vite and a headless Chromium on the real GPU. It flies to fixed viewpoints, measures GPU time

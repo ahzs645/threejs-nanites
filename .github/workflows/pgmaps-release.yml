@@ -1,0 +1,125 @@
+name: PGMaps scene release
+
+# A versioned release of the PGMaps scene page (examples/pgmaps-scene.html), which PGMaps embeds by URL. Pushing a tag
+# `pgmaps-scene-v<semver>` checks and builds the page alone (npm run build:pgmaps), attaches it as
+# pgmaps-scene-<version>.zip to a GitHub Release, then redeploys Pages: deploy-pages.yml unpacks every such release to
+# pgmaps/<version>/, because browsers cannot load a Release asset (no CORS headers) and PGMaps needs a URL that keeps
+# serving the same build. README.md, "PGMaps scene releases", says how to cut one.
+
+on:
+  push:
+    tags: ['pgmaps-scene-v*']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pgmaps-release-${{ github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Build and publish the release
+    permissions:
+      contents: write # create the release
+      actions: write # start deploy-pages.yml
+      pages: read # the site's address, for the notes
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      TAG: ${{ github.ref_name }}
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - name: Read the version from the tag
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! "${TAG}" =~ ^pgmaps-scene-v([0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?)$ ]]; then
+            echo "::error::${TAG} is not pgmaps-scene-v<major>.<minor>.<patch>[-prerelease]"
+            exit 1
+          fi
+          echo "version=${BASH_REMATCH[1]}" >> "${GITHUB_OUTPUT}"
+
+      - name: Check out the tag
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: PGMaps tests
+        run: npm run test:pgmaps
+
+      - name: Build the PGMaps scene page
+        env:
+          PGMAPS_SCENE_VERSION: ${{ steps.version.outputs.version }}
+        run: npm run build:pgmaps
+
+      - name: Stamp and pack
+        id: pack
+        shell: bash
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          commit="$(git rev-parse HEAD)"
+          engine="pgmaps-scene ${VERSION}+$(git rev-parse --short HEAD)"
+          # the page must report exactly this (vite.config.ts), never a -dirty build
+          grep -rqF "${engine}\`" dist-pgmaps/assets || grep -rqF "${engine}\"" dist-pgmaps/assets || {
+            echo "::error::the build does not report '${engine}'"
+            grep -rhoE 'pgmaps-scene [^`"]+' dist-pgmaps/assets | sort -u
+            exit 1
+          }
+          test -f dist-pgmaps/pgmaps-scene.html
+          jq -n --arg version "${VERSION}" --arg tag "${TAG}" --arg commit "${commit}" --arg engine "${engine}" \
+            --arg built "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            '{version: $version, tag: $tag, commit: $commit, engine: $engine, built: $built}' > dist-pgmaps/release.json
+          zip_name="pgmaps-scene-${VERSION}.zip"
+          (cd dist-pgmaps && zip -qrX "../${zip_name}" .)
+          echo "zip=${zip_name}" >> "${GITHUB_OUTPUT}"
+          echo "engine=${engine}" >> "${GITHUB_OUTPUT}"
+          echo "commit=${commit}" >> "${GITHUB_OUTPUT}"
+
+      - name: Create the GitHub Release
+        shell: bash
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          ZIP: ${{ steps.pack.outputs.zip }}
+          ENGINE: ${{ steps.pack.outputs.engine }}
+          COMMIT: ${{ steps.pack.outputs.commit }}
+        run: |
+          set -euo pipefail
+          site="$(gh api "repos/${GITHUB_REPOSITORY}/pages" --jq '.html_url' 2>/dev/null | sed 's#^http://#https://#' || true)"
+          if [[ -z "${site}" ]]; then site="https://${GITHUB_REPOSITORY_OWNER}.github.io/${GITHUB_REPOSITORY#*/}/"; fi
+          page="${site%/}/pgmaps/${VERSION}/pgmaps-scene.html"
+          notes="$(mktemp)"
+          {
+            echo "PGMaps scene page ${VERSION}, built from ${COMMIT}."
+            echo
+            echo "- Served at ${page} (embed: \`${page}?embed\`), once the Pages deploy this release starts has finished."
+            echo "- The page reports its version as \`${ENGINE}\` in its capture reply."
+            echo "- Every served version: ${site%/}/pgmaps/versions.json"
+            echo
+            echo "\`${ZIP}\` is the archive of that folder; browsers cannot load a Release asset directly."
+          } > "${notes}"
+          prerelease=()
+          if [[ "${VERSION}" == *-* ]]; then prerelease=(--prerelease); fi
+          if gh release view "${TAG}" >/dev/null 2>&1; then
+            gh release upload "${TAG}" "${ZIP}" --clobber
+            gh release edit "${TAG}" --notes-file "${notes}"
+          else
+            gh release create "${TAG}" "${ZIP}" --verify-tag --title "PGMaps scene ${VERSION}" --notes-file "${notes}" "${prerelease[@]}"
+          fi
+
+      - name: Start the Pages deploy
+        run: gh workflow run deploy-pages.yml --repo "${GITHUB_REPOSITORY}" --ref "${{ github.event.repository.default_branch }}"

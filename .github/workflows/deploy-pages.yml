@@ -3,6 +3,9 @@ name: Deploy GitHub Pages
 # Production deploy. The site is served from an aggregate `gh-pages` branch that
 # holds production at the root and open PR previews under `pr-preview/pr-N/`
 # (see pr-preview.yml); this job refreshes production and keeps open previews.
+# It also serves every PGMaps scene release (pgmaps-release.yml, which starts this
+# workflow): each `pgmaps-scene-v<version>` Release's zip is unpacked to
+# pgmaps/<version>/, with pgmaps/versions.json listing them.
 
 on:
   push:
@@ -24,7 +27,7 @@ jobs:
       pages: write
       pull-requests: read
     runs-on: ubuntu-24.04
-    timeout-minutes: 5
+    timeout-minutes: 10
     steps:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -58,6 +61,44 @@ jobs:
             });
             const paths = openPullRequests.map(({ number }) => `pr-preview/pr-${number}`);
             core.setOutput('paths', paths.join('\n'));
+
+      # Browsers cannot load a Release asset (GitHub sends no CORS headers), so Pages
+      # serves each release's build. A release that fails to download fails the deploy,
+      # which leaves the last deployed site (every version it served) in place.
+      - name: Unpack PGMaps scene releases
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          out="${RUNNER_TEMP}/pgmaps-releases/pgmaps"
+          mkdir -p "${out}"
+          list="${RUNNER_TEMP}/pgmaps-release-list.tsv"
+          entries="${RUNNER_TEMP}/pgmaps-release-entries.jsonl"
+          : > "${entries}"
+          gh release list --exclude-drafts --limit 1000 --json tagName,publishedAt \
+            --jq '.[] | select(.tagName | test("^pgmaps-scene-v[0-9]+\\.[0-9]+\\.[0-9]+(-[0-9A-Za-z.-]+)?$")) | [.tagName, .publishedAt] | @tsv' \
+            > "${list}"
+          while IFS=$'\t' read -r tag published; do
+            version="${tag#pgmaps-scene-v}"
+            zip_dir="$(mktemp -d)"
+            gh release download "${tag}" --pattern "pgmaps-scene-${version}.zip" --dir "${zip_dir}"
+            mkdir -p "${out}/${version}"
+            unzip -q "${zip_dir}/pgmaps-scene-${version}.zip" -d "${out}/${version}"
+            rm -rf "${zip_dir}"
+            test -f "${out}/${version}/pgmaps-scene.html"
+            jq -c --arg version "${version}" --arg tag "${tag}" --arg published "${published}" \
+              '{version: $version, tag: $tag, commit: .commit, engine: .engine, built: .built, published: $published,
+                page: ("pgmaps/" + $version + "/pgmaps-scene.html")}' \
+              "${out}/${version}/release.json" >> "${entries}"
+            echo "pgmaps/${version}/ from ${tag}"
+          done < "${list}"
+          # newest first (by version number); latest is the newest without a pre-release suffix
+          jq -s 'sort_by(.version | split("-")[0] | split(".") | map(tonumber)) | reverse
+                 | {latest: (map(select(.version | contains("-") | not)) | first | .version), versions: .}' \
+            "${entries}" > "${out}/versions.json"
+          cat "${out}/versions.json"
 
       - name: Stage production and retain open PR previews
         shell: bash
@@ -93,6 +134,7 @@ jobs:
           fi
 
           cp -a dist/. "${pages_dir}/"
+          cp -a "${RUNNER_TEMP}/pgmaps-releases/." "${pages_dir}/"
           touch "${pages_dir}/.nojekyll"
 
           git -C "${pages_dir}" config user.name "github-actions[bot]"
