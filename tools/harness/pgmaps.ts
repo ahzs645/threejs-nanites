@@ -5,6 +5,11 @@ import { join } from 'node:path';
 import type { Page } from 'playwright-core';
 import { at } from './status.ts';
 
+/** Match the fixture's pathname, not a page whose `scene` query ends in the fixture filename. */
+export function isPgmapsReplayFixture(url: URL): boolean {
+  return url.pathname === '/pgmaps-replay-fixture.json';
+}
+
 export async function runPgmapsReplay(page: Page, url: string, file: string, query: string, outDir: string): Promise<void> {
   const pkg = JSON.parse(readFileSync(file, 'utf8'));
   assert.equal(pkg.camera.projection?.kind, 'perspective', 'Replay fixture needs saved perspective metadata');
@@ -12,7 +17,7 @@ export async function runPgmapsReplay(page: Page, url: string, file: string, que
   const target = new URL(url);
   for (const [key, value] of new URLSearchParams(query)) target.searchParams.set(key, value);
   target.searchParams.set('scene', '/pgmaps-replay-fixture.json');
-  await page.route('**/pgmaps-replay-fixture.json', (route) => route.fulfill({ json: pkg }));
+  await page.route(isPgmapsReplayFixture, (route) => route.fulfill({ json: pkg }));
   const tag = `pgmaps-${target.port || 'replay'}`;
   const ready = async (): Promise<void> => {
     await page.waitForFunction(() => {

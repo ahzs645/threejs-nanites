@@ -94,3 +94,24 @@ test('a table with no stems gets one placeholder far under the ground; a table w
   const some = { ...empty, count: 1, data: [1, 2, 3, 0, 20, 4, 0.5] }
   assert.equal(withPlaceholderStem(some, 0, 0, 0), some)
 })
+
+test('a richer final stand adds fields to a legacy package without losing ids or typed view offsets',()=>{
+  const fields=['x','y','species','height'];
+  const pkg={fields,species:['pine'],count:1,data:[2000,0,0,20],ids:['kept']};
+  const all=new Float64Array([999,1,2,0,10,0,40,1,2,999]);
+  const data=all.subarray(1,9);
+  const final=readFinalOptions({quality:'final',stand:{fields:[...fields,'crownBase','dbhCm','expansion','source'],species:['cottonwood'],count:1,data,ids:['source-17'],radiusMeters:100,bearings:[0,360]}})!;
+  const merged=mergeStems(pkg,final.stand!,[0,0],field=>field==='crownBase'?-1:0);
+  assert.deepEqual(merged.ids,['kept','source-17']);
+  assert.deepEqual(merged.fields,[...fields,'crownBase','dbhCm','expansion','source']);
+  assert.equal(merged.data[merged.fields.indexOf('crownBase')],-1);
+  assert.deepEqual(Array.from(merged.data.slice(8)),[1,2,1,10,0,40,1,2]);
+});
+
+test('a valid sub-metre shrub survives final merging; an empty final stand removes covered package stems',()=>{
+  const pkg={fields:['x','y','z','species','height'],species:['pine'],count:1,data:[0,0,10,0,20]};
+  const empty:FinalStand={fields:pkg.fields,species:['pine'],count:0,data:new Float32Array(),radiusMeters:100,bearings:[0,360]};
+  assert.equal(mergeStems(pkg,empty,[0,0],()=>0).count,0);
+  const shrub:FinalStand={...empty,fields:[...pkg.fields,'form'],count:1,data:new Float32Array([1,1,10,0,.3,2])};
+  const merged=mergeStems(pkg,shrub,[0,0],()=>0);assert.equal(merged.count,1);assert.equal(merged.data[5],2);assert.ok(Math.abs(merged.data[4]-.3)<1e-6);
+});

@@ -124,7 +124,7 @@ export function stemDraw(x: number, y: number): number {
   return ((h ^ (h >>> 16)) >>> 0) / 4294967296;
 }
 
-export interface StemRows { fields: readonly string[]; count: number; data: ArrayLike<number> }
+export interface StemRows { ids?: readonly string[]; fields: readonly string[]; count: number; data: ArrayLike<number> }
 
 /**
  * The indexes of the stems the ground keeps: each stem kept when its draw is under the keep share at its place
@@ -151,7 +151,7 @@ export function thinStems<T extends StemRows & { data: ArrayLike<number> }>(t: T
   keep.forEach((i, k) => {
     for (let j = 0; j < st; j++) out[k * st + j] = t.data[i * st + j];
   });
-  return { table: { ...t, count: keep.length, data: out }, removed: t.count - keep.length };
+  return { table: { ...t, count: keep.length, data: out, ...(t.ids?{ids:keep.map(i=>t.ids![i])}:{}) }, removed: t.count - keep.length };
 }
 
 /** The scene's stems thinned by its cover (the package unchanged when it carries none). */

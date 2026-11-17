@@ -78,6 +78,10 @@
 //
 // The package is local metres: x east, y north, z up (heights absolute). Here y is up and north is -z.
 import * as THREE from 'three/webgpu';
+import { buildComponents, buildTreated, type ComponentDrawing } from './pgmaps/component-mesh.ts';
+import { dissolvePixels, readRenderOptions, renderOptionsFromUrl, type RenderOptions } from './pgmaps/render-options.ts';
+import { AdapterNaniteRenderer } from './pgmaps/adapter-renderer.ts';
+import { FramePacing } from './pgmaps/frame-pacing.ts';
 import { attribute, float, vec2, vec3, vec4, mix, hash, clamp, dot, positionWorld, select, texture, uniform, smoothstep, length, cameraPosition } from 'three/tsl';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import {
@@ -89,7 +93,7 @@ import { GodRays } from '../src/godrays.ts';
 import { detailPos } from '../src/planet.ts';
 import { reliefSteps } from '../src/ground/relief.ts';
 import { buildStand, type Stand } from './pgmaps/trees.ts';
-import { buildFarForest, planFarForest, setGrade, type FarForest } from './pgmaps/far-forest-scene.ts';
+import { buildFarForest, planFarForest, setGrade, PATCH_REACH, type FarForest } from './pgmaps/far-forest-scene.ts';
 import { lookGrade, type LookGrade } from './pgmaps/stand-patches.ts';
 import { mergeStems, syntheticStand, withPlaceholderStem, type FinalOptions } from './pgmaps/final-stand.ts';
 import { buildTerrain, buildMasks, inRing } from './pgmaps/terrain.ts';
@@ -132,6 +136,7 @@ type CameraMessage = { position: [number, number, number]; bearingDegrees: numbe
 type Drawing = {
   setEye: (eye: CameraMessage) => void;
   setEnvironment: (env: Environment) => void;
+  setRenderOptions: (options: RenderOptions) => void;
   capture: (request: CaptureRequest) => Promise<CaptureReply>;
   teardown: () => Promise<void>;
   /**
@@ -154,6 +159,10 @@ type CaptureReplyFrame = {
 type CaptureReply = {
   type: 'pgmaps-engine-capture'; engine: string; id: string; version: string; frames: CaptureReplyFrame[];
   scene: { createdAt: string | null; origin: ScenePackage['origin'] | null }; environment: Record<string, unknown> | null;
+  renderOptions: RenderOptions;
+  dissolve: {requestedPixels:number;mode:RenderOptions['dissolveMode'];referenceHeight:number;cutoffMeters:number|null;patchRadiusMeters:number;eyeOffsetMeters:number;guardMeters:number};
+  canopyCutoffMeters: number | null;
+  representation: { components: number; binnedTrees: number; topology: string };
   maxTreeHeightMeters: number | null; missing: string[]; missingDetail: string[];
   /** Stems by the class their tree took in the class pass (a layer's id, or 'vegetation'): not in PGMaps' protocol. */
   stemClasses: Record<string, number>;
@@ -169,6 +178,7 @@ let queued: ScenePackage | null = null;
 /** The queued package came as its key alone (it is the one drawn now): see `show`. */
 let queuedKeyOnly: string | null = null;
 let latestCamera: CameraMessage | null = null;
+let latestRenderOptions = renderOptionsFromUrl(params);
 let latestEnvironment: Environment = environmentFromUrl(params) ?? DEFAULT_ENVIRONMENT;
 let environmentOverridden = environmentFromUrl(params) !== null;
 /** Why the last build failed (a capture waiting on it says so). */
@@ -237,6 +247,7 @@ async function show(scene: ScenePackage, keyOnly: string | null = null): Promise
       shown.lap('build');
     }
     currentScene = scene;
+    current.setRenderOptions(latestRenderOptions);
     current.setEnvironment(latestEnvironment); // (one that came during the build)
     if (latestCamera) current.setEye(latestCamera);
     lastError = null;
@@ -287,6 +298,9 @@ addEventListener('message', (event: MessageEvent) => {
       (reply) => toParent(reply, reply.frames.flatMap((f) => [f.classes.buffer, f.screened.buffer, f.depth.buffer, ...(f.zones ? [f.zones.buffer] : [])])),
       (error: unknown) => toParent({ type: 'pgmaps-engine-capture', id: typeof data.id === 'string' ? data.id : null, error: error instanceof Error ? error.message : String(error) }),
     );
+  } else if (data?.type === 'pgmaps-render-options') {
+    latestRenderOptions=readRenderOptions(data.options,latestRenderOptions);
+    if(current&&!building)current.setRenderOptions(latestRenderOptions);
   } else if (data?.type === 'pgmaps-environment') {
     const env = parseEnvironment(data);
     if (!env) return;
@@ -401,6 +415,10 @@ function standLook(snow: THREE.UniformNode<'float', number>, grade: LookGrade): 
 
 async function build(scene: ScenePackage, env0: Environment): Promise<Drawing> {
   if (scene?.format !== 'pgmaps-forest-scene' || scene.version !== 1) throw new Error('Not a PGMaps forest scene package (v1).');
+  let renderOptions={...latestRenderOptions};
+  let captureActive=false;
+  let pendingCaptureEye:CameraMessage|null=null;
+  const pacing=new FramePacing();
   const t0 = performance.now();
   const built = stages();
   timing.build = built.ms;
@@ -471,6 +489,7 @@ async function build(scene: ScenePackage, env0: Environment): Promise<Drawing> {
   let updateViewport = (): void => {};
   /** The package's eye (local metres, z up, bearing clockwise from north) as the camera and the orbit's target. */
   const setEye = (e: CameraMessage): void => {
+    if(captureActive){pendingCaptureEye=e;return;}
     savedProjection = e.projection;
     const b = THREE.MathUtils.degToRad(e.bearingDegrees), p = THREE.MathUtils.degToRad(e.pitchDegrees);
     camera.position.set(e.position[0], e.position[2], -e.position[1]);
@@ -504,9 +523,12 @@ async function build(scene: ScenePackage, env0: Environment): Promise<Drawing> {
   const plan = planFarForest(scene);
   // (a stand of no stems, a view over open water, drawn as one stem far under the ground: no zero-sized buffers)
   const placeholder = <T extends ScenePackage['trees']>(t: T): T => withPlaceholderStem(t, eye.position[0], eye.position[1], terrain.heightAt(eye.position[0], -eye.position[1]));
+  const liveComponents=buildComponents(plan?plan.trees:scene.trees,ditherShift);
+  let components=liveComponents;
+  three.add(components.group);
   const [floor, stand] = await Promise.all([
     floorMaterial({ masks, snow: envr.snow, wet: envr.wet, fadeShadow: (far) => envr.fadeShadow(far), coverGrade: groundGrade }),
-    buildStand({ ...scene, trees: placeholder(plan ? plan.trees : scene.trees) }, samples, plan?.extra ?? []),
+    buildStand({ ...scene, trees: placeholder(liveComponents.naniteTrees) }, samples, plan?.extra ?? []),
   ]);
   built.lap('floorAndStand');
   terrain.mesh.material = floor;
@@ -514,6 +536,8 @@ async function build(scene: ScenePackage, env0: Environment): Promise<Drawing> {
   three.add(terrain.mesh);
   const debris = await buildDebris(scene, terrain.heightAt, envr.snow);
   if (debris) three.add(debris);
+  const treated=buildTreated(scene.treated);
+  if(treated)three.add(treated);
   built.lap('debris');
   const water = buildWater(scene, terrain.waterLevels, { sunDir: envr.lightDir, sunColour: envr.sun.color });
   built.lap('water');
@@ -618,7 +642,7 @@ async function build(scene: ScenePackage, env0: Environment): Promise<Drawing> {
   };
   /** A stand as a Nanite renderer with its impostors baked: the live one, or a final capture's (real density). */
   const naniteOf = async (st: Stand, maxDist: number, { lap, ms }: ReturnType<typeof stages>) => {
-    const n = new NaniteRenderer(renderer, st.types, st.instances, st.textures, look);
+    const n = new AdapterNaniteRenderer(renderer, st.types, st.instances, st.textures, look);
     n.u.maxDist.value = maxDist;
     n.u.tau.value = Number(params.get('tau') ?? 2); // (px of error: at 1 the stand's lists overflowed into 17-35 ms frames on an M4 Pro, at 2 ~5.5 ms)
     n.group.traverse((o) => {
@@ -648,7 +672,7 @@ async function build(scene: ScenePackage, env0: Environment): Promise<Drawing> {
   const live = await naniteOf(stand, Math.max(9000, (treeReach(eye.position[0], eye.position[1]) ?? 0) + 1500), built);
   const liveNanite = live.nanite, atlas = live.atlas;
   /** The stand drawn now: the live one, or a final capture's while it draws. */
-  let nanite = liveNanite;
+  let nanite: NaniteRenderer = liveNanite;
   three.add(nanite.group);
   /** The far forest (built with the capture's drapes, below). */
   let farForest: FarForest | null = null;
@@ -663,10 +687,11 @@ async function build(scene: ScenePackage, env0: Environment): Promise<Drawing> {
   const size = new THREE.Vector2();
   let viewWidth = 0, viewHeight = 0;
   const resize = (): void => {
+    if(captureActive)return;
     const box = host.viewport();
     const view = fitCameraViewport(savedProjection, box.width, box.height);
-    if (Math.min(box.pixelRatio, 1.5) !== renderer.getPixelRatio()) {
-      renderer.setPixelRatio(Math.min(box.pixelRatio, 1.5));
+    if (Math.min(box.pixelRatio, 1.5)*renderOptions.resolutionScale !== renderer.getPixelRatio()) {
+      renderer.setPixelRatio(Math.min(box.pixelRatio, 1.5)*renderOptions.resolutionScale);
       viewWidth = 0; // (the drawing buffer changes size with it)
     }
     camera.aspect = view.aspect;
@@ -679,6 +704,8 @@ async function build(scene: ScenePackage, env0: Environment): Promise<Drawing> {
     }
     host.place(renderer.domElement, view);
   };
+  const applyCulling=():void=>{(nanite as AdapterNaniteRenderer).frustumCulling=renderOptions.frustumCulling;components.culling(renderOptions.frustumCulling);for(const g of [treated,farForest?.group])g?.traverse(o=>{if(o instanceof THREE.Mesh)o.frustumCulled=renderOptions.frustumCulling;});};
+  const setRenderOptions=(options:RenderOptions):void=>{if(captureActive)return;renderOptions={...options};applyCulling();resize();};
   updateViewport = resize;
   const unlistenResize = host.onResize(resize);
   resize();
@@ -700,7 +727,8 @@ async function build(scene: ScenePackage, env0: Environment): Promise<Drawing> {
   };
 
   const still = new THREE.Vector3(); // (the TAA's planet drop: none here)
-  let lastStats = 0, lastPost = 0, disposed = false;
+  let lastStats = 0, lastPost = 0, disposed = false, gpuFailed = false;
+  let completedAtPost=0, completionPostAt=performance.now();
   /** Ready is to be said again at the next frame (the same package posted again, `again`). */
   let readyDue = false;
   /** The stats readback in flight: teardown waits for it, since destroying the device aborts its mapAsync. */
@@ -712,6 +740,7 @@ async function build(scene: ScenePackage, env0: Environment): Promise<Drawing> {
   };
   host.expose({ pgmaps: state });
   setEnvironment(env0);
+  applyCulling();
   const t1 = performance.now();
   /**
    * The scene into sceneRT from `camera` at `size`: `live`, as shown (the shadow map, the god rays' switch and TAA's
@@ -737,7 +766,9 @@ async function build(scene: ScenePackage, env0: Environment): Promise<Drawing> {
     // 70% of it): near the ground its tiny leaf clusters, dithered, came out as pale specks on the crowns' tips
     const altitude = camera.position.y - terrain.heightAt(camera.position.x, camera.position.z);
     nanite.sw.idle = nanite.splats.idle = altitude < (nanite.sw.idle ? 2000 : 1400);
-    farForest?.update(camera, size.y, cutoffPx);
+    const transition=farForest?.update(camera, size.y, dissolvePixels(renderOptions,size.y,cutoffPx));
+    components.transition(transition,camera.position);
+    (nanite as AdapterNaniteRenderer).frustumCulling=renderOptions.frustumCulling;
     nanite.update(camera, size, time, castShadows ? envr.sun.shadow.camera : null);
     // phase 1: ground, sky and the trees visible last frame (and the shadow map)
     renderer.setRenderTarget(sceneRT);
@@ -754,18 +785,31 @@ async function build(scene: ScenePackage, env0: Environment): Promise<Drawing> {
     camera.layers.set(0);
     renderer.autoClear = autoClear;
   };
+  const gpuFailure=(reason:unknown):void=>{
+    state.queue=pacing.stats();
+    if(gpuFailed||disposed)return;
+    gpuFailed=true;renderer.setAnimationLoop(null);
+    const message=`GPU completion failed: ${reason instanceof Error?reason.message:String(reason)}`;
+    lastError=message;state.error=message;state.lastError=message;state.queue=pacing.stats();
+    host.status(message);toParent({type:'pgmaps-engine-error',message});
+  };
   const frame = (): void => {
-    state.frames++;
+    if(gpuFailed||disposed)return;
     const now = performance.now();
+    controls.update();
+    if(!pacing.allow(now,renderOptions.maxFps,renderOptions.maxInFlight))return;
+    state.frames++;
     fps = fps ? fps * 0.9 + (1000 / Math.max(1, now - lastFrame)) * 0.1 : 60;
     lastFrame = now;
     const time = (now - t1) / 1000;
-    controls.update();
     drawScene(time, true);
     rays.render(camera, size.x, size.y);
     taa.resolve(camera, still);
     renderer.setRenderTarget(null);
     output.render();
+    pacing.submitted(device.queue.onSubmittedWorkDone(),now,()=>performance.now(),gpuFailure);
+    state.renderOptions={...renderOptions};state.queue=pacing.stats();
+    state.rendererInfo={memory:{...renderer.info.memory},render:{...renderer.info.render}};
     if (state.frames === 1) {
       built.lap('firstFrame');
       state.buildMs = Math.round(performance.now() - t0);
@@ -783,11 +827,14 @@ async function build(scene: ScenePackage, env0: Environment): Promise<Drawing> {
         state.ready = state.frames > 10;
         if (time - lastPost >= 1) {
           lastPost = time;
+          const reportedAt=performance.now(),completedFps=(pacing.completed-completedAtPost)*1000/Math.max(1,reportedAt-completionPostAt);
+          completedAtPost=pacing.completed;completionPostAt=reportedAt;
           toParent({
-            type: 'pgmaps-engine-stats', drawn: s.instances + s.impostors, fps: Math.round(fps),
+            type: 'pgmaps-engine-stats', completedFps:Math.round(completedFps), drawn: s.instances + s.impostors + components.count, fps: Math.round(fps),
             clusters: s.instances, impostors: s.impostors, splats: s.splats ?? 0, stems: scene.trees.count,
             crownErrorMean: +stand.residual.mean.toFixed(4), crownErrorP90: +stand.residual.p90.toFixed(4), sun: sunReport,
-            environment: envr.skyReport(),
+            environment: envr.skyReport(), renderOptions, queue:pacing.stats(), rendererInfo:state.rendererInfo,
+            representation:{components:components.count,componentChunks:components.chunks,componentDraws:components.draws,componentChunkMeters:components.chunkMeters,binnedTrees:liveComponents.naniteTrees.count,topology:'instanced dimensional envelopes / binned ez-tree'},
           });
         }
       }, () => (reading = null));
@@ -870,6 +917,7 @@ async function build(scene: ScenePackage, env0: Environment): Promise<Drawing> {
       });
       three.add(farForest.group);
       farForest.setLook(drawnEnvironment.look ?? 'via');
+      applyCulling();
       state.farForest = farForest.stats;
     } catch (error) {
       console.error('far forest', error);
@@ -881,7 +929,7 @@ async function build(scene: ScenePackage, env0: Environment): Promise<Drawing> {
   waterClass.colorNode = classWater;
   const waterMeshes = water ? water.group.children.filter((o): o is THREE.Mesh => o instanceof THREE.Mesh) : [];
   // each tree's stem (package x, y) in the instances' order, and whether it stands in water
-  const stemXY = new Float32Array(stand.instances.a.length / 2);
+  const stemXY = new Float32Array(liveComponents.naniteTrees.count ? stand.instances.a.length / 2 : 0);
   for (let k = 0; k < stemXY.length / 2; k++) (stemXY[k * 2] = stand.instances.a[k * 4]), (stemXY[k * 2 + 1] = -stand.instances.a[k * 4 + 2]);
   const waterRings = (scene.water ?? []).filter((w) => w?.rings?.[0]?.length >= 3).map((w) => {
     const xs = w.rings[0].map((q) => q[0]), ys = w.rings[0].map((q) => q[1]);
@@ -899,13 +947,14 @@ async function build(scene: ScenePackage, env0: Environment): Promise<Drawing> {
    */
   const classMode = (pass: 'screened' | 'ground' | 'zones'): (() => void) => {
     const zones = pass === 'zones';
-    const shown = (o: THREE.Object3D) => o === terrain.mesh || ((o === nanite.group || o === farForest?.group) && pass === 'screened') || (o === water?.group && !zones);
+    const shown = (o: THREE.Object3D) => o === terrain.mesh || ((o === nanite.group || o === components.group || o === farForest?.group) && pass === 'screened') || (o === water?.group && !zones);
     const hidden = three.children.filter((o) => o.visible && !(o instanceof THREE.Light) && !shown(o));
     const was = {
       debug: nanite.u.debug.value, extinction: envr.extinction.value, sun: envr.sun.intensity, hemi: envr.hemi.intensity,
       terrain: terrain.mesh.material, water: waterMeshes.map((m) => m.material), clear: renderer.getClearColor(new THREE.Color()), alpha: renderer.getClearAlpha(),
     };
     for (const o of hidden) o.visible = false; // (sky, dome, debris, precipitation; the bare passes: the stand; the zone pass: the water)
+    components.flat(true);
     nanite.u.debug.value = CLASS_DEBUG;
     if (farForest) farForest.u.flat.value = 1;
     envr.extinction.value = 0; // (no haze)
@@ -915,6 +964,7 @@ async function build(scene: ScenePackage, env0: Environment): Promise<Drawing> {
     renderer.setClearColor(0x000000, 0);
     return () => {
       for (const o of hidden) o.visible = true;
+      components.flat(false);
       nanite.u.debug.value = was.debug;
       if (farForest) farForest.u.flat.value = 0;
       envr.extinction.value = was.extinction;
@@ -1015,7 +1065,7 @@ async function build(scene: ScenePackage, env0: Environment): Promise<Drawing> {
   // The request's stand at real density drawn in place of the package's stems where it reaches (a second Nanite
   // renderer, kept for the next capture of the same stand), the far forest hidden there, the canopy cut-off from the
   // request, the shadow map widened over the frame's near stand, the samples accumulated with the camera held.
-  type FinalDrawing = { key: string; nanite: NaniteRenderer; stems: number; stemXY: Float32Array };
+  type FinalDrawing = { key: string; nanite: NaniteRenderer; components: ComponentDrawing; stems: number; stemXY: Float32Array };
   let finalDrawing: FinalDrawing | null = null;
   const disposeGroup = (g: THREE.Object3D) => g.traverse((o) => {
     if (o instanceof THREE.Mesh) {
@@ -1034,7 +1084,7 @@ async function build(scene: ScenePackage, env0: Environment): Promise<Drawing> {
     const key = standKey(st, eyeXY);
     timing.capture.standKey = Math.round((performance.now() - tKey) * 10) / 10;
     if (finalDrawing?.key === key) return finalDrawing;
-    if (finalDrawing) disposeGroup(finalDrawing.nanite.group);
+    if (finalDrawing) {disposeGroup(finalDrawing.nanite.group);disposeGroup(finalDrawing.components.group);}
     finalDrawing = null;
     const made = stages();
     timing.finalStand = made.ms;
@@ -1047,20 +1097,23 @@ async function build(scene: ScenePackage, env0: Environment): Promise<Drawing> {
     const merged = snagStems(thinned.table, covered.rasters, viewYear0, (name) => scene.species?.[name]?.crownRatio).table;
     made.lap('snags');
     state.finalCoverRemoved = thinned.removed;
-    const grown = await buildStand({ ...scene, trees: placeholder({ fields: merged.fields, species: merged.species, count: merged.count, data: merged.data as unknown as number[] }) }, samples);
+    const finalComponents=buildComponents({ fields:merged.fields,species:merged.species,count:merged.count,data:Array.from(merged.data),ids:merged.ids?Array.from(merged.ids):undefined },ditherShift);
+    const grown = await buildStand({ ...scene, trees: placeholder(finalComponents.naniteTrees) }, samples);
     made.lap('buildStand');
     const { nanite: n } = await naniteOf(grown, Math.max(9000, st.radiusMeters + 1500, liveNanite.u.maxDist.value), made);
     n.setDepthSource(sceneRT.depthTexture!, samples);
-    const xy = new Float32Array(grown.instances.a.length / 2);
+    const xy = new Float32Array(finalComponents.naniteTrees.count ? grown.instances.a.length / 2 : 0);
     for (let k = 0; k < xy.length / 2; k++) (xy[k * 2] = grown.instances.a[k * 4]), (xy[k * 2 + 1] = -grown.instances.a[k * 4 + 2]);
-    finalDrawing = { key, nanite: n, stems: merged.count, stemXY: xy };
+    finalDrawing = { key, nanite: n, components: finalComponents, stems: merged.count, stemXY: xy };
     made.lap('finish');
     return finalDrawing;
   };
   /** Draws `n` in place of the live stand (and back). */
   const swapStand = (n: NaniteRenderer): void => {
     if (n === nanite) return;
-    three.remove(nanite.group);
+    three.remove(nanite.group,components.group);
+    components=n===liveNanite?liveComponents:finalDrawing!.components;
+    three.add(components.group);components.culling(renderOptions.frustumCulling);
     nanite = n;
     three.add(nanite.group);
     state.nanite = nanite;
@@ -1077,10 +1130,20 @@ async function build(scene: ScenePackage, env0: Environment): Promise<Drawing> {
     return run;
   };
   const captureOnce = async (request: CaptureRequest): Promise<CaptureReply> => {
-    while (!disposed && state.frames < 3) await new Promise((resolve) => setTimeout(resolve, 50)); // (the first frames compile)
+    while (!disposed && !gpuFailed && state.frames < 3) await new Promise((resolve) => setTimeout(resolve, 50)); // (the first frames compile)
     if (disposed) throw new Error('The scene was replaced before the capture.');
+    if(gpuFailed)throw new Error(lastError??'The GPU backend failed.');
     renderer.setAnimationLoop(null);
+    captureActive=true;
+    await pacing.drain();
     await reading?.catch(() => undefined);
+    const liveOptions={...renderOptions};
+    const liveState={position:camera.position.clone(),quaternion:camera.quaternion.clone(),up:camera.up.clone(),fov:camera.fov,aspect:camera.aspect,
+      size:size.clone(),taaSize:taa.size,prepass:liveNanite.leafPrepass.mode,impMin:impMinPx.value,impExact:impExact.value,maxWeight:taaU.maxWeight.value};
+    renderOptions=readRenderOptions(request.renderOptions,renderOptions);
+    const appliedOptions={...renderOptions};
+    applyCulling();
+    try {
     const final = request.final;
     const took = stages();
     timing.capture = took.ms;
@@ -1089,7 +1152,7 @@ async function build(scene: ScenePackage, env0: Environment): Promise<Drawing> {
     let finalReport: CaptureReply['final'] = null;
     if (final) {
       cutoffPx = final.canopyCutoffPx;
-      if (final.stand && final.stand.count > 0) {
+      if (final.stand) {
         const fd = await finalStandDrawing(final.stand, [request.position[0], request.position[1]]);
         swapStand(fd.nanite);
         farForest?.hide({ eye: [request.position[0], request.position[1]], radius: final.stand.radiusMeters, bearings: final.stand.bearings });
@@ -1108,6 +1171,9 @@ async function build(scene: ScenePackage, env0: Environment): Promise<Drawing> {
     const tStems = performance.now();
     const stems = stemClasses({ stems: nanite === liveNanite ? stemXY : finalDrawing!.stemXY, rasters, terrain: request.classes.terrain, vegetation: request.classes.vegetation, layers: request.classes.layers, onWater });
     nanite.setInstanceClasses(stems.rgb);
+    const componentClasses=stemClasses({stems:components.xy,rasters,terrain:request.classes.terrain,vegetation:request.classes.vegetation,layers:request.classes.layers,onWater});
+    components.setClasses(componentClasses.rgb);
+    for(const [key,value] of Object.entries(componentClasses.counts))stems.counts[key]=(stems.counts[key]??0)+value;
     farForest?.setClasses({ rasters, terrain: request.classes.terrain, vegetation: request.classes.vegetation, layers: request.classes.layers, onWater });
     state.lastStemClasses = { counts: stems.counts, ms: Math.round(performance.now() - tStems) };
     classWater.value.copy(linear(request.classes.water));
@@ -1118,6 +1184,7 @@ async function build(scene: ScenePackage, env0: Environment): Promise<Drawing> {
     const seen: SeenGround = { drawn: 0, invented: 0, filled: 0, far: 0, beyondTrees: 0 };
     const [ex, ey] = request.position;
     const reach = treeReach(ex, ey);
+    const capturedRepresentation={components:components.count,binnedTrees:components.naniteTrees.count,topology:'instanced dimensional envelopes / binned ez-tree'};
     try {
       nanite.leafPrepass.mode = false; // (its depth pass dithers as the picture does; the picture is the same without it)
       impExact.value = 1; // (every impostor at its own size: none thinned, none dropped)
@@ -1154,10 +1221,11 @@ async function build(scene: ScenePackage, env0: Environment): Promise<Drawing> {
       impExact.value = saved.impExact;
       impMinPx.value = saved.impMin;
       nanite.setInstanceClasses(null);
+      components.setClasses(null);
       farForest?.setClasses(null);
       taaU.maxWeight.value = saved.maxWeight;
       if (final) {
-        finalReport = { samples: final.samples, stems: nanite === liveNanite ? stand.instances.a.length / 4 : finalDrawing!.stems, canopyCutoffMeters: farForest ? Math.round(farForest.cutoff()) : null, millis: Math.round(performance.now() - tFinal) };
+        finalReport = { samples: final.samples, stems: nanite === liveNanite ? liveComponents.naniteTrees.count + components.count : finalDrawing!.stems, canopyCutoffMeters: farForest ? Math.round(farForest.cutoff()) : null, millis: Math.round(performance.now() - tFinal) };
         swapStand(liveNanite);
         farForest?.hide(null);
         envr.setShadowHalf(null);
@@ -1165,7 +1233,6 @@ async function build(scene: ScenePackage, env0: Environment): Promise<Drawing> {
         finalWater = false;
         setEnvironment(drawnEnvironment);
       }
-      if (!disposed) renderer.setAnimationLoop(frame);
       took.lap('frames');
     }
     const outer = terrain.ground.outer;
@@ -1183,12 +1250,27 @@ async function build(scene: ScenePackage, env0: Environment): Promise<Drawing> {
       type: 'pgmaps-engine-capture', engine: ENGINE, id: request.id, version: VERSION, frames,
       scene: { createdAt: createdAt ?? null, origin: origin ?? null },
       environment: { ...drawnEnvironment, ...envr.skyReport(), sun: sunReport },
+      dissolve:{requestedPixels:final?.canopyCutoffPx??appliedOptions.dissolvePixels,mode:appliedOptions.dissolveMode,referenceHeight:appliedOptions.dissolveReferenceHeight,
+        cutoffMeters:farForest?.cutoff()??null,patchRadiusMeters:PATCH_REACH,eyeOffsetMeters:Math.hypot(ex-scene.camera.position[0],ey-scene.camera.position[1]),guardMeters:90},
+      renderOptions:appliedOptions, canopyCutoffMeters:finalReport?.canopyCutoffMeters??farForest?.cutoff()??null,
+      representation:capturedRepresentation,
       maxTreeHeightMeters: maxTreeHeight,
       missing, missingDetail,
       stemClasses: stems.counts,
       timings,
       final: finalReport,
     };
+    } finally {
+      camera.position.copy(liveState.position);camera.quaternion.copy(liveState.quaternion);camera.up.copy(liveState.up);
+      camera.fov=liveState.fov;camera.aspect=liveState.aspect;camera.updateProjectionMatrix();camera.updateMatrixWorld();
+      size.copy(liveState.size);sceneRT.setSize(size.x,size.y);taa.size=liveState.taaSize;taa.reset=true;
+      impMinPx.value=liveState.impMin;impExact.value=liveState.impExact;taaU.maxWeight.value=liveState.maxWeight;liveNanite.leafPrepass.mode=liveState.prepass;
+      nanite.setInstanceClasses(null);components.setClasses(null);components.flat(false);farForest?.setClasses(null);if(farForest)farForest.u.flat.value=0;
+      cutoffPx=undefined;swapStand(liveNanite);farForest?.hide(null);envr.setShadowHalf(null);finalWater=false;
+      renderOptions=liveOptions;captureActive=false;setRenderOptions(latestRenderOptions);setEnvironment(drawnEnvironment);
+      if(pendingCaptureEye){const eye=pendingCaptureEye;pendingCaptureEye=null;setEye(eye);}
+      if(!disposed&&!gpuFailed)renderer.setAnimationLoop(frame);
+    }
   };
   state.capture = (request: unknown) => capture(request);
   /** A synthetic real-density stand over a request's frames (testing a final capture without PGMaps): `&standRadius=` m (6500). */
@@ -1203,12 +1285,13 @@ async function build(scene: ScenePackage, env0: Environment): Promise<Drawing> {
   return {
     setEye,
     setEnvironment,
+    setRenderOptions,
     capture: captureNow,
     sameAs: (next, env) => {
       // (the year a build would take now: the environment's instant, else the copy's own stamp; neither: the clock,
       // never the same twice)
       const year = yearFrom(env, next.createdAt);
-      return year !== null && year === viewYear0 && (env.look ?? 'via') === (env0.look ?? 'via');
+      return !gpuFailed && year !== null && year === viewYear0 && (env.look ?? 'via') === (env0.look ?? 'via');
     },
     again: async (next) => {
       await capturing;

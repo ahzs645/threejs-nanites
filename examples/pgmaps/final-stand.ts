@@ -10,6 +10,7 @@ export interface FinalStand {
   species: string[];
   count: number;
   data: Float32Array;
+  ids?: string[];
   radiusMeters: number;
   /** Bearing span covered, degrees clockwise from north, [from, to] (may wrap past 360). */
   bearings: [number, number];
@@ -49,11 +50,13 @@ function readStand(s: unknown): FinalStand | null {
   const count = finite(s.count) ? Math.round(s.count) : -1;
   if (count < 0 || count > MAX_FINAL_STEMS) throw new Error(`The final stand's count must be 0 to ${MAX_FINAL_STEMS.toLocaleString('en')}.`);
   const raw = s.data;
-  const data = raw instanceof Float32Array ? raw : Array.isArray(raw) ? Float32Array.from(raw as number[]) : ArrayBuffer.isView(raw) ? new Float32Array((raw as ArrayBufferView).buffer as ArrayBuffer) : null;
+  const data = raw instanceof Float32Array ? raw : Array.isArray(raw) ? Float32Array.from(raw as number[]) : ArrayBuffer.isView(raw) && 'length' in raw ? Float32Array.from(raw as unknown as ArrayLike<number>) : null;
   if (!data || data.length < count * fields.length) throw new Error('The final stand\'s data is shorter than count × fields.');
   const radiusMeters = finite(s.radiusMeters) && s.radiusMeters > 0 ? s.radiusMeters : 0;
   const b = Array.isArray(s.bearings) && s.bearings.length === 2 && s.bearings.every(finite) ? (s.bearings as [number, number]) : ([0, 360] as [number, number]);
-  return { fields, species, count, data, radiusMeters, bearings: [b[0], b[1]] };
+  const ids=Array.isArray(s.ids)&&s.ids.length===count&&s.ids.every(v=>typeof v==='string')?s.ids as string[]:undefined;
+  if(s.ids!==undefined&&!ids)throw new Error('The final stand ids must align with count.');
+  return { fields, species, count, data, ...(ids?{ids}:{}), radiusMeters, bearings: [b[0], b[1]] };
 }
 
 /** Whether a bearing (degrees from north, clockwise) lies in [from, to], which may wrap past 360 or be a full turn. */
@@ -88,7 +91,7 @@ export interface MergedStems extends StemTable {
  * `fill(field, x, y)` (its ground height for `z`, NaN otherwise; tone 0.5).
  */
 export function mergeStems(pkg: StemTable, stand: FinalStand, eye: readonly [number, number], fill: (field: string, x: number, y: number) => number): MergedStems {
-  const fields = [...pkg.fields];
+  const fields = [...new Set([...pkg.fields, ...stand.fields])];
   const species = [...pkg.species];
   const speciesOf = stand.species.map((name) => {
     let k = species.indexOf(name);
@@ -107,12 +110,12 @@ export function mergeStems(pkg: StemTable, stand: FinalStand, eye: readonly [num
   const good: number[] = [];
   for (let i = 0; i < stand.count; i++) {
     const o = i * st0, h = stand.data[o + sh0];
-    if (Number.isFinite(stand.data[o + sx0]) && Number.isFinite(stand.data[o + sy0]) && Number.isFinite(h) && h > 0.5) good.push(i);
+    if (Number.isFinite(stand.data[o + sx0]) && Number.isFinite(stand.data[o + sy0]) && Number.isFinite(h) && h > 0) good.push(i);
   }
   const count = keep.length + good.length;
   const data = new Float32Array(count * stride);
   keep.forEach((i, k) => {
-    for (let j = 0; j < stride; j++) data[k * stride + j] = pkg.data[i * pf.stride + j];
+    for (let j = 0; j < stride; j++) { const from=pkg.fields.indexOf(fields[j]); data[k*stride+j]=from>=0?pkg.data[i*pf.stride+from]:fill(fields[j],pkg.data[i*pf.stride+pf.x],pkg.data[i*pf.stride+pf.y]); }
   });
   const from = fields.map((f) => stand.fields.indexOf(f));
   const sx = stand.fields.indexOf('x'), sy = stand.fields.indexOf('y'), ss = stand.fields.indexOf('species'), sStride = stand.fields.length;
@@ -126,7 +129,8 @@ export function mergeStems(pkg: StemTable, stand: FinalStand, eye: readonly [num
       }
     });
   });
-  return { fields, species, count, data, fromStand: good.length, kept: keep.length };
+  const ids=[...keep.map(i=>pkg.ids?.[i]??`package-${i}`),...good.map(i=>stand.ids?.[i]??`final-${i}`)];
+  return { fields, species, count, data, ids, fromStand: good.length, kept: keep.length };
 }
 
 /**

@@ -24,6 +24,7 @@ export interface TerrainGrid {
    * older packages (the adapter then reads the stems' crowns).
    */
   canopy?: Array<number | null>;
+  stand?: { cells: number[]; records: Array<{ heightMeters: number; species: Array<{ species: string; share: number; heightMeters?: number }>; source: 'regional' | 'inventory' | 'imported' }> };
   /**
    * Natural ground cover at each post, the same layout (PGMaps' `SCENE_COVER`, ground-cover.ts COVER): 0 forest,
    * 1 sparse forest, 2 shrub, 3 herb/grass, 4 rock or exposed soil, 5 water, 6 cut ground, 7 burnt (a recent wildfire:
@@ -65,13 +66,14 @@ export interface ScenePackage {
    */
   skylineTerrain?: TerrainGrid & { earthCurvature?: { earthRadiusMeters: number; refraction: number } };
   /** fields: x, y, z, species (index into `species`), height, crownWidth, tone (0..1). */
-  trees: { fields: string[]; species: string[]; count: number; data: number[] };
+  trees: { fields: string[]; species: string[]; count: number; data: number[]; ids?: string[] };
   species?: Record<string, SpeciesInfo>;
   models?: Record<string, { positions: number[]; normals: number[]; bark: number[] }>;
   /** Cut blocks and other cleared ground. */
   openings?: Opening[];
   /** Slash piles and logs: fields x, y, z, footprint (m across). */
   debris?: { fields: string[]; count: number; data: number[] };
+  treated?: { fields: readonly string[]; kinds: readonly string[]; count: number; data: ArrayLike<number> };
   /** Road cut and fill slopes: exposed soil and rock. */
   roadScars?: Array<{ kind: 'cut' | 'fill'; ring: Ring }>;
   /** Lakes and ponds (optional): outer ring then holes; the surface's elevation, or null for the lowest ground on the shore. */

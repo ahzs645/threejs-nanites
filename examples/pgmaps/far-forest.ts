@@ -28,7 +28,7 @@ export const MAX_STEMS_HA = 1000;
 /** A tree's crown width / height in the patches and the final stand, at most (the proposal's "≤ 0.35"). */
 export const REAL_RATIO_MAX = 0.35;
 
-export interface StemTable { fields: readonly string[]; species: readonly string[]; count: number; data: ArrayLike<number> }
+export interface StemTable { ids?: readonly string[]; fields: readonly string[]; species: readonly string[]; count: number; data: ArrayLike<number> }
 
 /** The fields' indexes (x, y, z, species, height, crownWidth, tone; -1 absent). */
 export function fieldIndex(fields: readonly string[]) {
@@ -39,6 +39,8 @@ export function fieldIndex(fields: readonly string[]) {
 /** Whether stem i stands for many trees (its crown wider than AGGREGATE_RATIO of its height, or twice its species'). */
 export function isAggregate(t: StemTable, i: number, speciesRatio: (name: string) => number | undefined = () => undefined): boolean {
   const f = fieldIndex(t.fields);
+  const source=t.fields.indexOf('source'), expansion=t.fields.indexOf('expansion');
+  if ((source>=0 && t.data[i*f.stride+source]===2) || (expansion>=0 && t.data[i*f.stride+expansion]===1)) return false;
   if (f.crownWidth < 0 || f.height < 0) return false;
   const o = i * f.stride, w = t.data[o + f.crownWidth], h = t.data[o + f.height];
   if (!(w > 0 && h > 0)) return false;
@@ -184,6 +186,7 @@ export interface PatchOptions {
   maxReach?: number;
   /** The share of a place's closure its ground keeps (ground-cover.ts: none on rock and water); null or absent: all. */
   keepAt?: (x: number, y: number) => number | null;
+  standAt?: (x:number,y:number)=>import('./stand-palette.ts').StandRecord|null;
 }
 
 /**
@@ -212,7 +215,14 @@ export function standPatches(cells: StandCells, heightAt: (x: number, y: number)
       if (!(closure >= MIN_PATCH_CLOSURE)) continue;
       let sp = cells.commonSpecies, best = 0;
       for (let j = 0; j < ns; j++) if (cells.shares[k * ns + j] > best) (best = cells.shares[k * ns + j]), (sp = j);
-      const h = Number.isFinite(cells.height[k]) ? cells.height[k] : cells.medianHeight;
+      const known=o.standAt?.(x,y);
+      let h = Number.isFinite(cells.height[k]) ? cells.height[k] : cells.medianHeight;
+      if(known){
+        h=known.heightMeters;
+        const mix=known.species.filter(s=>s.share>0 && cells.species.includes(s.species));
+        const total=mix.reduce((n,s)=>n+s.share,0);let at=cellRandom(c,r,7)*total;
+        for(const s of mix){at-=s.share;if(at<=0){sp=cells.species.indexOf(s.species);h=s.heightMeters??h;break;}}
+      }
       const z = heightAt(x, y), dd = cells.cell / 4;
       const gx = (heightAt(x + dd, y) - heightAt(x - dd, y)) / (2 * dd), gy = (heightAt(x, y + dd) - heightAt(x, y - dd)) / (2 * dd);
       if (!Number.isFinite(z)) continue;
@@ -234,7 +244,7 @@ export function stemsPerHectare(closure: number, crownWidth: number): number {
 }
 
 /** The distance (m) at which a tree `height` tall is `px` pixels tall through a lens of `focalPx` (VNS's dissolve). */
-export const cutoffMeters = (px: number, focalPx: number, height: number): number => (height * focalPx) / Math.max(0.5, px);
+export const cutoffMeters = (px: number, focalPx: number, height: number): number => (height * focalPx) / Math.max(1e-6, px);
 /** A frame's focal length in pixels from its height and vertical field (degrees). */
 export const focalPixels = (heightPx: number, verticalFovDegrees: number): number => heightPx / 2 / Math.tan((verticalFovDegrees * Math.PI) / 360);
 
@@ -252,6 +262,7 @@ export const SPECIES_CANOPY: Record<string, Rgb> = {
   douglasFir: [0.05, 0.072, 0.045],
   aspen: [0.075, 0.11, 0.05],
   birch: [0.08, 0.11, 0.055],
+  hemlock: [.033,.058,.039], blackSpruce: [.031,.053,.041], cottonwood: [.075,.115,.055],
 };
 const DEFAULT_CANOPY: Rgb = [0.045, 0.07, 0.045];
 export const canopyColourOf = (species: string): Rgb => SPECIES_CANOPY[species] ?? DEFAULT_CANOPY;
@@ -322,7 +333,7 @@ export function canopyField(
   closureAt: (x: number, y: number) => number | null,
   cells: StandCells | null,
   colourOf: (species: number) => Rgb,
-  o: { cell?: number; maxSide?: number; unknownClosure?: number; medianHeight?: number; commonSpecies?: number; keepAt?: (x: number, y: number) => number | null } = {},
+  o: { cell?: number; maxSide?: number; unknownClosure?: number; medianHeight?: number; commonSpecies?: number; keepAt?: (x: number, y: number) => number | null; standAt?: (x:number,y:number)=>import('./stand-palette.ts').StandRecord|null } = {},
 ): CanopyField {
   const cell = Math.max(o.cell ?? 120, Math.max(extent.east - extent.west, extent.north - extent.south) / (o.maxSide ?? 1024));
   const columns = Math.max(2, Math.ceil((extent.east - extent.west) / cell)), rows = Math.max(2, Math.ceil((extent.north - extent.south) / cell));
@@ -349,6 +360,11 @@ export function canopyField(
             if (mix[0] + mix[1] + mix[2] > 0) rgb = mix;
           }
         }
+      }
+      const known=o.standAt?.(x,y);
+      if(known){h=known.heightMeters;const mixed:Rgb=[0,0,0];let sum=0;
+        for(const s of known.species){const j=cells?.species.indexOf(s.species)??-1;if(j<0||!(s.share>0))continue;sum+=s.share;for(let i=0;i<3;i++)mixed[i]+=palette[j][i]*s.share;}
+        if(sum>0)rgb=mixed.map(v=>v/sum) as Rgb;
       }
       // (the ground's share of it: none on rock, herb, shrub and water, ground-cover.ts CANOPY_KEEP)
       stand.set([(posted ?? o.unknownClosure ?? 0.55) * (o.keepAt?.(x, y) ?? 1), h, posted === null ? 0 : 1, 1], k * 4);

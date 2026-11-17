@@ -47,7 +47,7 @@ function grow(job: GrowJob) {
   const o = tree.options as unknown as Options;
   mergeOptions(o as unknown as Record<string, unknown>, job.look.options);
   o.seed = job.seed;
-  if (job.crownBase !== null) o.branch.start[1] = Math.min(0.8, Math.max(0.05, job.crownBase));
+  if (job.crownBase !== null) o.branch.start[1] = Math.min(0.8, Math.max(0, job.crownBase));
   // the crown's width by its branches' length: a few rounds towards the ratio (ez-tree's growth isn't linear in it)
   const base = { ...o.branch.length };
   const keys = job.look.conifer ? [1] : [1, 2];

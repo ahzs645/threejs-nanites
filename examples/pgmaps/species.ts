@@ -38,6 +38,9 @@ export const SPECIES: Record<string, SpeciesLook> = {
   aspen: { preset: 'Aspen Large', conifer: false, bark: 'birch', leaf: 'aspen', barkTint: [0.9, 0.95, 0.86], leafTint: [0.4, 0.74, 0.82], options: { leaves: { count: 22 } }, seed: 505 },
   // paper birch: white bark, small leaves (the ash image)
   birch: { preset: 'Aspen Large', conifer: false, bark: 'birch', leaf: 'ash', barkTint: [1, 1, 1], leafTint: [0.9, 0.9, 0.86], options: { branch: { angle: { 1: 38 } }, leaves: { count: 24, size: 2.6 } }, seed: 606 },
+  hemlock: { preset: 'Pine Large', conifer: true, bark: 'pine', leaf: 'pine', barkTint: [.76,.7,.67], leafTint: [.44,.60,.94], options: conifer(132,24,2.2), seed: 808 },
+  blackSpruce: { preset: 'Pine Large', conifer: true, bark: 'pine', leaf: 'pine', barkTint: [.61,.59,.59], leafTint: [.40,.55,.98], options: conifer(115,20,1.8), seed: 909 },
+  cottonwood: { preset: 'Aspen Large', conifer: false, bark: 'oak', leaf: 'aspen', barkTint: [.82,.83,.75], leafTint: [.52,.82,.74], options: { branch: { angle: { 1: 48 } }, leaves: { count: 28, size: 3.3 } }, seed: 1010 },
   // a snag on burnt ground (burnt.ts: the adapter's own species, never PGMaps'): a fire-killed conifer, no needles, its
   // branches charred stubs out from a grey-black trunk (the Gun Lake renders' bare grey-black spikes)
   snag: {

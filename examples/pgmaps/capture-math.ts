@@ -1,3 +1,4 @@
+import { readRenderOptions, type RenderOptions } from './render-options.ts';
 // The pure parts of PGMaps' capture request (`pgmaps-capture`, PGMaps' src/pages/dev-forestry/engineCapture.ts): the
 // request read and checked, each frame's pinhole as a three.js camera pose, the class layers rasterized over the
 // terrain grid, and the GPU's readbacks (padded rows, half floats, the depth buffer) turned into the reply's straight
@@ -33,6 +34,7 @@ export interface CaptureRequest {
   zones?: { terrain: Rgb; layers: CaptureLayer[] };
   /** `quality: 'final'`: the report's still (final-stand.ts); null: active, as the road view draws. */
   final: FinalOptions | null;
+  renderOptions?: RenderOptions;
 }
 
 /** Frames bigger than this a side are refused (WebGPU's guaranteed texture size). */
@@ -76,6 +78,7 @@ export function readCaptureRequest(data: unknown): CaptureRequest {
     classes: { terrain: rgbOf(c.terrain, 'terrain'), layers, vegetation: rgbOf(c.vegetation, 'vegetation'), water: rgbOf(c.water, 'water') },
     ...(z ? { zones: { terrain: rgbOf(z.terrain, 'zone terrain'), layers: layersOf(z.layers, 'Zone') } } : {}),
     final: readFinalOptions(data),
+    ...(data.renderOptions?{renderOptions:readRenderOptions(data.renderOptions)}:{}),
   };
 }
 

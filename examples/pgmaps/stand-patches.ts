@@ -17,6 +17,7 @@
 // cut-off it gives way to the canopy surface, pixel by pixel with the same dither (complementary). In a flat pass it
 // is its ground's class colour (`setClasses`), cut at alpha 0.5 with no dither.
 import * as THREE from 'three/webgpu';
+import { chunkPatchMesh } from './patch-chunks.ts';
 import {
   Fn, If, Discard, attribute, cameraPosition, cameraViewMatrix, cross, float, vec2, vec3, vec4, normalize, positionGeometry,
   select, texture, uniform, uniformArray, varying, clamp, asin, abs, dot, mix, max, min, fract, floor, length, smoothstep, uint, atan, screenCoordinate,
@@ -382,6 +383,7 @@ export function buildPatchMesh(patches: Patches, atlas: PatchAtlas, u: FarUnifor
   mesh.frustumCulled = false;
   mesh.receiveShadow = true;
   mesh.name = 'stand-patches';
+  const chunks=chunkPatchMesh(mesh,patches,Math.max(...atlas.frameH),BAKE_HEIGHT,PATCH_METERS);
   return {
     mesh,
     count: patches.count,
@@ -390,6 +392,7 @@ export function buildPatchMesh(patches: Patches, atlas: PatchAtlas, u: FarUnifor
       if (!rgb) arr.fill(0);
       else for (let i = 0; i < patches.count; i++) arr.set([lin(rgb[i * 3]), lin(rgb[i * 3 + 1]), lin(rgb[i * 3 + 2]), 1], i * 4);
       classes.needsUpdate = true;
+      chunks.syncClasses();
     },
   };
 }

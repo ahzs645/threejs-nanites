@@ -168,5 +168,8 @@ export function buildCanopySurface(geometry: THREE.BufferGeometry, field: Canopy
   mesh.frustumCulled = false;
   mesh.receiveShadow = true;
   mesh.name = 'canopy-surface';
+  geometry.computeBoundingBox();
+  if(geometry.boundingBox){let height=0;for(let k=1;k<field.stand.length;k+=4)height=Math.max(height,field.stand[k]);
+    geometry.boundingBox.max.y+=height;geometry.boundingSphere=geometry.boundingBox.getBoundingSphere(new THREE.Sphere());}
   return { mesh, gain, dispose: () => (material.dispose(), tex.stand.dispose(), tex.colour.dispose()) };
 }

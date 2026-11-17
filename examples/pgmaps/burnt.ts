@@ -166,7 +166,7 @@ export function fireYearAt(rasters: readonly CoverRaster[], x: number, y: number
 }
 
 /** A stem table as the adapter keeps them (the package's `trees`, a final stand merged into them). */
-export interface SnagTable { fields: readonly string[]; species: readonly string[]; count: number; data: ArrayLike<number> }
+export interface SnagTable { ids?: readonly string[]; fields: readonly string[]; species: readonly string[]; count: number; data: ArrayLike<number> }
 
 /**
  * The stems on burnt ground stood dead: each stem whose draw (a hash of its place, not the cover thinning's) falls
@@ -185,6 +185,7 @@ export function snagStems<T extends SnagTable>(t: T, rasters: readonly CoverRast
   // Float32Array.from over the lot, were 0.4 s of a final stand's 1.4 M stems; the values are the same)
   const typed = t.data instanceof Float32Array;
   const out: Float32Array | number[] = typed ? new Float32Array(t.count * st) : new Array<number>(t.count * st);
+  const ids:string[]=[];
   let snags = 0, fallen = 0, kept = 0;
   for (let i = 0; i < t.count; i++) {
     const o = i * st, x = t.data[o + fx], y = t.data[o + fy];
@@ -201,11 +202,12 @@ export function snagStems<T extends SnagTable>(t: T, rasters: readonly CoverRast
       out[k + fs] = snagIndex;
       snags++;
     }
+    if(t.ids)ids.push(t.ids[i]);
     kept++;
   }
   if (!snags && !fallen) return { table: t, snags, fallen };
   const data = kept === t.count ? out : out.slice(0, kept * st);
-  return { table: { ...t, species: known >= 0 ? t.species : [...t.species, SNAG_SPECIES], count: kept, data }, snags, fallen };
+  return { table: { ...t, species: known >= 0 ? t.species : [...t.species, SNAG_SPECIES], count: kept, data, ...(t.ids?{ids}:{}) }, snags, fallen };
 }
 
 /** The scene with its stems on burnt ground stood dead (snagStems), and the snag's species info. */

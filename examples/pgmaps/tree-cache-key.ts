@@ -17,7 +17,7 @@ import { contentHash } from './content-hash.ts';
  * a change to tree-worker.ts (`grow`, `measure`, the reply), to species.ts's `mergeOptions`, to RATIO_MAX, or to the
  * cluster DAG it builds (src/nanite-lib/dag/). A bump empties every browser's cache of grown trees.
  */
-export const GROW_VERSION = 1;
+export const GROW_VERSION = 2;
 /** How an entry is stored (tree-cache.ts): bump when its layout changes. */
 export const TREE_CACHE_FORMAT = 1;
 

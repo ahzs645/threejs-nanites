@@ -19,6 +19,8 @@ import { SNAG_DENSITY_RATIO, SNAG_SPECIES, burntShareSampler, hasBurn, withSnagC
 import { stemClasses, type CaptureLayer, type ClassTexture, type Rgb as CaptureRgb } from './capture-math.ts';
 import type { ExtraRung } from './trees.ts';
 import type { ScenePackage } from './package.ts';
+import { standSampler } from './stand-palette.ts';
+import { coverageCutoff } from './render-options.ts';
 import type { Terrain } from './terrain.ts';
 
 const params = new URLSearchParams(location.search);
@@ -62,7 +64,7 @@ export function planFarForest(scene: ScenePackage): FarPlan | null {
   });
   // every species the patches may draw, at its real crown ratio (at most REAL_RATIO_MAX)
   const extra: ExtraRung[] = scene.trees.species.map((name, species) => ({ species, ratio: Math.min(REAL_RATIO_MAX, speciesRatio(name) ?? 0.17) }));
-  return { cells, trees: { ...scene.trees, count: keep.length, data }, extra, speciesRatio };
+  return { cells, trees: { ...scene.trees, count: keep.length, data, ...(scene.trees.ids?{ids:keep.map(i=>scene.trees.ids![i])}:{}) }, extra, speciesRatio };
 }
 
 export interface FarForest {
@@ -118,7 +120,8 @@ export async function buildFarForest(i: FarInputs): Promise<FarForest> {
   // water); the canopy surface keeps none on rock, herb and shrub, some on sparse forest
   const treeKeep = rasters.length ? coverShareSampler(rasters, TREE_KEEP) : undefined;
   const canopyKeep = rasters.length ? coverShareSampler(rasters, CANOPY_KEEP) : undefined;
-  const patches = standPatches(cells, heightAt, closureAt, { eye, maxReach: PATCH_REACH, keepAt: treeKeep });
+  const standAt=standSampler([scene.terrain,scene.farTerrain,scene.skylineTerrain]);
+  const patches = standPatches(cells, heightAt, closureAt, { eye, maxReach: PATCH_REACH, keepAt: treeKeep, standAt });
   // (a patch on burnt ground is a snag stand, whatever species its cell's stems led with: past the stems' reach the
   // cells take the commonest live species)
   const snagIndex = scene.trees.species.indexOf(SNAG_SPECIES);
@@ -141,7 +144,7 @@ export async function buildFarForest(i: FarInputs): Promise<FarForest> {
     const types = Array.from({ length: 12 }, () => own).flat();
     for (const [j, n] of lead) {
       const theirs = i.extraTypes.get(j);
-      if (j !== sp && sp !== snag && j !== snag && theirs?.length) for (let r = 0; r < Math.round((8 * n) / patches.count); r++) types.push(...theirs);
+      if (!scene.terrain.stand && !scene.farTerrain?.stand && !scene.skylineTerrain?.stand && j !== sp && sp !== snag && j !== snag && theirs?.length) for (let r = 0; r < Math.round((8 * n) / patches.count); r++) types.push(...theirs);
     }
     const name = scene.trees.species[sp] ?? '';
     // (snags at the density of the live stand they were: its crowns, not their stubs, set the stems a hectare)
@@ -153,7 +156,7 @@ export async function buildFarForest(i: FarInputs): Promise<FarForest> {
   // the canopy's colour per species: the patches' own mean albedo where baked (no step at the switch), else a palette
   const colourOf = (sp: number): Rgb => atlas.meanAlbedo[sp] ?? SPECIES_CANOPY[scene.trees.species[sp] ?? ''] ?? [0.045, 0.07, 0.045];
   const outer = terrain.ground.outer;
-  const field = canopyField(outer, closureAt, cells, colourOf, { cell: 90, maxSide: 1024, keepAt: canopyKeep });
+  const field = canopyField(outer, closureAt, cells, colourOf, { cell: 90, maxSide: 1024, keepAt: canopyKeep, standAt });
   const classColour = select(length(i.drape.colour.sub(i.drape.rest)).lessThan(1e-3), i.drape.vegetation, i.drape.colour) as Vec3;
   const canopy = buildCanopySurface(terrain.mesh.geometry, field, u, i.receivedShadow(), classColour, i.cover, i.viewYear);
   canopy.gain.value = Number(params.get('canopygain') ?? 1);
@@ -163,13 +166,17 @@ export async function buildFarForest(i: FarInputs): Promise<FarForest> {
   patchMesh.mesh.visible = params.get('patches') !== '0';
   canopy.mesh.visible = params.get('canopy') !== '0';
   canopy.mesh.renderOrder = 1; // (with the terrain: after the stand and slabs)
+  const sourceGrid=scene.farTerrain??scene.terrain;
   const median = cells.medianHeight || 22;
   let cut = 4000;
   void float, vec3;
   return {
     group, u, patches, patchMesh, canopy,
     update(camera, heightPx, cutoffPx = CUTOFF_PX) {
-      cut = Math.min(PATCH_REACH * 0.93, Math.max(CUTOFF_MIN, cutoffMeters(cutoffPx, focalPixels(heightPx, camera.fov), median)));
+      const x=camera.position.x,y=-camera.position.z;
+      const offset=Math.hypot(x-eye[0],y-eye[1]);
+      const edge=Math.min(x-sourceGrid.west,sourceGrid.west+(sourceGrid.columns-1)*sourceGrid.spacing-x,y-sourceGrid.south,sourceGrid.south+(sourceGrid.rows-1)*sourceGrid.spacing-y);
+      cut = coverageCutoff(Math.max(CUTOFF_MIN, cutoffMeters(cutoffPx, focalPixels(heightPx, camera.fov), median)),PATCH_REACH,offset,edge);
       u.cutoff.value = cut;
       return cut;
     },
@@ -200,7 +207,7 @@ export async function buildFarForest(i: FarInputs): Promise<FarForest> {
     dispose() {
       atlas.dispose();
       canopy.dispose();
-      patchMesh.mesh.geometry.dispose();
+      patchMesh.mesh.traverse(o=>{if(o instanceof THREE.Mesh)o.geometry.dispose();});
     },
   };
 }
